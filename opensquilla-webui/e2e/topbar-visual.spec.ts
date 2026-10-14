@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import {
+  acknowledgeTopbarDeliverables,
   expectTopbarConsoleClean,
   expectTopbarGeometry,
   openTopbarSession,
@@ -72,12 +73,15 @@ test.describe('Chat topbar visual regression', () => {
         sessionKey: `${TOPBAR_SESSION_KEY}-visual-${scenario.name}`,
         ...scenario.fixture,
       })
+      // These baselines represent already-read deliverables. Opening and closing
+      // their real workbench makes that state explicit even if hydration set New.
+      await acknowledgeTopbarDeliverables(page, scenario.fixture.deliverableCount!)
       await expectTopbarGeometry(page, {
         minimumTargetSize: scenario.viewport.width <= 768 ? 44 : undefined,
       })
 
       if ((scenario.fixture.approvalCount ?? 0) > 99) {
-        const badge = page.getByTestId('chat-system-status-badge')
+        const badge = page.getByTestId('chat-system-approval').locator('.chat-system-status__count')
         await expect(badge).toHaveText('99+')
         const bounds = await badge.evaluate(element => {
           const box = element.getBoundingClientRect()

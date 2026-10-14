@@ -244,8 +244,11 @@ _SESSION_MUTATION_METHODS = frozenset({
     "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
 })
 _SESSION_IDENTITY_MUTATIONS = frozenset({
-    "sessions.reset", "sessions.delete", "sessions.truncate", "sessions.contextCompact",
+    "sessions.reset", "sessions.delete", "sessions.truncate",
 })
+# Compaction preserves the session owner and canonical conversation. Keep its
+# existing subscription live during summary recovery; the completed lifecycle
+# event triggers history refresh. It remains an ordered session mutation above.
 # Running mutations retain their existing completion semantics after a peer
 # leaves. Strong references keep their result supervised until completion.
 _DRAINING_ORDINARY_WORKERS: set[asyncio.Task[None]] = set()
@@ -277,6 +280,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "sandbox.runtime.status",
         "sessions.list",
         "sessions.search",
+        "sessions.messages.search",
         "sessions.messages.hydrate",
         "turns.receipt.get",
         "usage.status",
@@ -290,7 +294,9 @@ _PROVIDER_PROBE_METHODS: frozenset[str] = frozenset(
         "onboarding.provider.probe",
     }
 )
-_CANCELLABLE_REQUEST_METHODS = _PROVIDER_PROBE_METHODS | frozenset({"sessions.search"})
+_CANCELLABLE_REQUEST_METHODS = _PROVIDER_PROBE_METHODS | frozenset({
+    "sessions.search", "sessions.messages.search",
+})
 _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
@@ -331,7 +337,7 @@ def _should_detach_rpc_request(method: str, params: Any) -> bool:
 
 
 def _is_cancellable_request(method: str, params: Any) -> bool:
-    if method == "sessions.search":
+    if method in {"sessions.search", "sessions.messages.search"}:
         return True
     if method not in _CANCELLABLE_REQUEST_METHODS or not isinstance(params, dict):
         return False
@@ -4049,7 +4055,7 @@ async def _dispatch_and_send(
     detached: bool = False,
     cancellable: bool = False,
 ) -> None:
-    if method == "sessions.search":
+    if method in {"sessions.search", "sessions.messages.search"}:
         from opensquilla.session.recovery_reads import recovery_read_scope
 
         # Use the existing read budget and exclusive SQLite leases. Search is

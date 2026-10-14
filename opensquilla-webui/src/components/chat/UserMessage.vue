@@ -70,7 +70,7 @@
             <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
           </span>
           <button
-            v-if="canReusePromptAnnotations && !shareMode"
+            v-if="canReusePromptAnnotations && !shareMode && !annotation.selection"
             type="button"
             class="msg-prompt-annotation__reuse"
             :title="t('chat.promptAnnotations.reuseDescription')"
@@ -217,7 +217,7 @@
           <span class="msg-file-chip__name">{{ localPathName(path) }}</span>
         </span>
       </div>
-      <div v-if="visibleMessageText" class="msg-user-bubble">
+      <div v-if="visibleMessageText" class="msg-user-bubble" data-chat-find-body>
         {{ visibleMessageText }}
       </div>
       <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">

@@ -47,6 +47,9 @@ export type TopbarUpdateState = {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
+  canAutoDownload?: boolean
+  releaseNotesUrl?: string | null
   installMode: 'native' | 'manual' | 'unsupported'
   releaseUrl: string | null
   source: 'oss' | 'github' | null
@@ -385,7 +388,7 @@ async function installMockGateway(
 }
 
 export async function waitForTopbarStable(page: Page, theme?: string) {
-  await expect(page.locator('.conn-pill.connected').first()).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]').first()).toBeVisible({ timeout: 10_000 })
   await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(1)
   await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10_000 })
   if (theme) await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
@@ -394,6 +397,37 @@ export async function waitForTopbarStable(page: Page, theme?: string) {
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
   })
+}
+
+/** Establish the visual fixture's read state through the real acknowledgement action. */
+export async function acknowledgeTopbarDeliverables(page: Page, count: number) {
+  const header = page.getByTestId('chat-header-actions')
+  await expect(header.locator('.chat-header__count-badge').first())
+    .toHaveText(count > 99 ? '99+' : String(count))
+  const layout = await header.getAttribute('data-layout')
+  if (layout === 'wide') {
+    await page.getByTestId('chat-session-action-deliverables').click()
+  } else if (layout === 'compact') {
+    await page.getByTestId('chat-header-primary-action').click()
+  } else {
+    expect(layout).toBe('tight')
+    await page.getByTestId('chat-session-actions-trigger').click()
+    await page.getByTestId('chat-session-action-deliverables').click()
+  }
+  const workbench = page.getByTestId('workbench-host')
+  await expect(workbench).toBeVisible()
+  await expect(workbench.getByRole('tab', { name: `status-report-${count}.csv`, exact: true }))
+    .toHaveAttribute('aria-selected', 'true')
+  if (count > 1) {
+    await expect(workbench.getByRole('combobox').locator('option')).toHaveCount(count)
+  }
+  await workbench.locator('.workbench-host__tab-wrap').hover()
+  await workbench.locator('.workbench-host__tab-close').click()
+  await expect(workbench).toBeHidden()
+  await expect(header).toHaveAttribute('data-layout', layout!)
+  await expect(header.locator('.chat-header__new-badge, .chat-header__new-dot')).toHaveCount(0)
+  await page.mouse.move(0, page.viewportSize()!.height - 1)
+  await waitForTopbarStable(page)
 }
 
 export async function openTopbarSession(page: Page, options: TopbarScenario = {}) {
@@ -416,7 +450,7 @@ export async function openTopbarSession(page: Page, options: TopbarScenario = {}
   await expect(page.locator('html')).toHaveAttribute('lang', locale)
   await waitForTopbarStable(page, theme)
   if (approvalCount > 0) {
-    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-severity', 'danger')
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
   }
 
   return {

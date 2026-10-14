@@ -1,13 +1,18 @@
+import type { ProviderRecovery } from '@/types/parts'
+import { providerRetrySeconds, providerRecoveryIdentity } from '@/utils/chat/providerRecovery'
 import type {
   ChatRenderedMessage,
   ChatStreamTimelineItem,
+  ChatToolCallGroup,
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
+import type { ReasoningBlock } from '@/types/turnlog'
 import {
   compactionCompletedLabelCode,
   compactionSkippedLabelCode,
 } from '@/utils/chat/compactionStatus'
+import { activityToolName, isAnswerTransparentControlTool } from '@/utils/chat/toolDisplay'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -114,6 +119,7 @@ export interface AssistantActivityCluster {
 export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
+  | `chat.activity.provider.${keyof typeof import('@/locales/en.json')['chat']['activity']['provider']}`
   | 'chat.activity.provider.waiting'
   | 'chat.activity.provider.responded'
   | 'chat.activity.provider.reasoning'
@@ -133,6 +139,9 @@ export type AssistantActivityStatusCode =
   | 'chat.compact.failed'
 
 export interface AssistantActivityStatusStep {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
@@ -165,6 +174,45 @@ export interface AssistantActivityTimelineProjection {
   statusSteps: AssistantActivityStatusStep[]
 }
 
+/** Match the unified renderer's per-source ordering contract before selecting it. */
+export function canMergeAssistantActivityOrder(
+  statusSteps: readonly AssistantActivityStatusStep[],
+  reasoningBlocks: readonly ReasoningBlock[],
+  timelineItems: readonly ChatStreamTimelineItem[],
+): boolean {
+  // An old record may retain only an aggregate failure. Splitting that group
+  // would either discard the failure or falsely assign it to successful calls.
+  if (timelineItems.some(item => item.type === 'tool-group'
+    && hasUnattributedActivityGroupFailure(item.group))) return false
+  const validOrder = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+  const sources: Array<Array<number | undefined>> = [
+    statusSteps.filter(isVisibleActivityStatusStep).map(step => step.activityOrder),
+    reasoningBlocks.filter(block => block.text).map(block => block.activityOrder),
+    timelineItems.flatMap(item => {
+      if (item.type !== 'tool-group') return [item.activityOrder]
+      const callOrders = item.group.calls.map(call => call.activityOrder).filter(validOrder)
+      const fallback = validOrder(item.activityOrder)
+        ? item.activityOrder
+        : validOrder(item.group.activityOrder)
+          ? item.group.activityOrder
+          : callOrders.length ? Math.min(...callOrders) : undefined
+      return item.group.calls.map(call => call.activityOrder ?? fallback)
+    }),
+  ]
+  return sources.some(source => source.length > 0)
+    && sources.every(source => source.every((order, index) =>
+      validOrder(order) && (index === 0 || order >= source[index - 1]!),
+    ))
+}
+
+export function hasUnattributedActivityGroupFailure(group: ChatToolCallGroup): boolean {
+  return group.calls.length > 1
+    && !group.isRunning
+    && (group.isError || group.status === 'error')
+    && group.calls.every(call => !call.isRunning && !call.isError && call.status !== 'error')
+}
+
 export interface ProjectAssistantActivityOptions {
   lifecycle?: AssistantActivityLifecycle
   statusHistory?: readonly StatusPart[]
@@ -184,6 +232,10 @@ export interface LiveAssistantTimelineSplitOptions {
    * stream outside without relying on a timing heuristic.
    */
   keepToolTurnTextInActivity?: boolean
+  /** Latest real, revocable input draft; affects layout only, never tool execution. */
+  toolInputPreviewOrder?: number
+  /** Render an answer's raw text only when a later draft moves it into activity. */
+  renderActivityMarkdown?: (text: string) => string
 }
 
 export interface AssistantActivityProjection extends AssistantActivityTimelineProjection {
@@ -279,15 +331,6 @@ const COMMAND_TOOLS = new Set([
 ])
 const ARTIFACT_TOOLS = new Set(['publish_artifact'])
 const MEMORY_TOOLS = new Set(['memory_search', 'search_memory'])
-// Progress has a dedicated Plan/Goal surface and must not inflate the generic
-// tool count. Successful progress calls are answer-transparent, so an update
-// after a terminal summary does not hide that answer.
-// Keep the retired checkpoint spelling for historical PlanRun transcripts,
-// where a successful control call could end the turn after the final summary.
-const ANSWER_TRANSPARENT_CONTROL_TOOLS = new Set([
-  'plan_run_checkpoint',
-  'update_plan',
-])
 const FILE_TARGET_KEYS = [
   'path',
   'file_path',
@@ -335,6 +378,23 @@ export function splitLiveAssistantTimeline(
   options: LiveAssistantTimelineSplitOptions = {},
 ): LiveAssistantTimelineSplit {
   const last = timeline[timeline.length - 1]
+  if (last?.type === 'text'
+    && Number.isSafeInteger(last.activityOrder) && Number(last.activityOrder) > 0
+    && Number.isSafeInteger(options.toolInputPreviewOrder)
+    && Number(options.toolInputPreviewOrder) > Number(last.activityOrder)) {
+    // A later real input draft must not appear above the text preceding it.
+    // Preserve the original order/presentation, without adding a tool boundary
+    // to the turn log. Revoking the draft restores normal answer placement.
+    const activityItems = timeline.slice()
+    if (!last.html && last.rawText && options.renderActivityMarkdown) {
+      // The live fold omits trailing answer HTML because StreamingTextPart
+      // normally renders its raw text. ActivityNarration needs a display copy.
+      activityItems[activityItems.length - 1] = {
+        ...last, html: options.renderActivityMarkdown(last.rawText),
+      }
+    }
+    return { activityItems, answerItem: null }
+  }
   if (
     options.keepToolTurnTextInActivity
     && timeline.some(item => item.type === 'tool-group')
@@ -400,16 +460,6 @@ function codeDescriptor<Code extends string>(
   return { code, params }
 }
 
-function activityToolName(name: string): string {
-  const normalized = String(name || '')
-    .trim()
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .toLowerCase()
-    .replace(/-/g, '_')
-  const namespaced = normalized.split(/__|[.:/]/).filter(Boolean)
-  return namespaced[namespaced.length - 1] || ''
-}
-
 function isSettledSuccessfulToolGroup(
   item: ChatStreamTimelineItem,
 ): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
@@ -448,7 +498,7 @@ function isSuccessfulAnswerTransparentControlGroup(
 ): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
   return isSettledSuccessfulToolGroup(item)
     && item.group.calls.every(call =>
-      ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(call.name))
+      isAnswerTransparentControlTool(call.name)
     )
 }
 
@@ -1053,7 +1103,7 @@ export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep):
     && code !== 'chat.activity.provider.reasoning'
 }
 
-/** Routine model phases shown as the small per-phase flow underneath the turn header. */
+/** Routine model phases used for live feedback and retained timing data. */
 export function isRoutineActivityPhaseStep(step: AssistantActivityStatusStep): boolean {
   return step.category !== 'maintenance' && (
     step.label.code === 'chat.activity.provider.waiting'
@@ -1061,6 +1111,7 @@ export function isRoutineActivityPhaseStep(step: AssistantActivityStatusStep): b
     || step.label.code === 'chat.activity.provider.reasoning'
     || step.label.code === 'chat.activity.lifecycle.answering'
     || step.label.code === 'chat.activity.lifecycle.answerPrepared'
+    || step.label.code === 'chat.activity.lifecycle.preparingToolCall'
   )
 }
 
@@ -1074,19 +1125,15 @@ export function isBeforeReasoningActivityStatusStep(
 }
 
 /**
- * Status rows worth retaining in the finished activity record. Reasoning owns
- * a richer disclosure, so its status boundary is used for timing but is not
- * duplicated as an empty row.
+ * Status rows worth displaying in the activity transcript. Routine requesting
+ * and writing phases only describe the current live operation; their recorded
+ * boundaries still own timing but do not become completed work items.
+ * Reasoning owns its richer disclosure instead of an empty phase row.
  */
 export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): boolean {
   if (step.category === 'maintenance') return true
   if (step.label.code === 'chat.activity.provider.reasoning') return false
-  if (
-    step.label.code === 'chat.activity.provider.waiting'
-    || step.label.code === 'chat.activity.provider.responded'
-    || step.label.code === 'chat.activity.lifecycle.answering'
-    || step.label.code === 'chat.activity.lifecycle.answerPrepared'
-  ) return true
+  if (isRoutineActivityPhaseStep(step)) return step.isCurrent
   if (step.label.code.startsWith('chat.activity.provider.')) return true
   return isSemanticActivityStatusStep(step)
 }
@@ -1098,20 +1145,39 @@ export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): 
  * delay.  Keeping the one-second ticking local avoids turning countdown UI
  * into wire traffic while still making a long Retry-After visibly progress.
  */
-export function providerActivityRemainingSeconds(
-  step: AssistantActivityStatusStep,
-  nowMs: number = Date.now(),
-): number | null {
-  if (
-    step.label.code !== 'chat.activity.provider.rateLimited'
-    && step.label.code !== 'chat.activity.provider.retryWait'
-  ) {
-    return null
+export function providerActivityRemainingSeconds(step: AssistantActivityStatusStep, nowMs = Date.now()): number | null {
+  return step.isCurrent ? providerRetrySeconds(step.providerRecovery, nowMs) : null
+}
+
+/** Live and replay share wording; only the active, timed plan can count down. */
+export function providerActivityLabel(step: AssistantActivityStatusStep, nowMs = Date.now(), announce = false): AssistantActivityCodeDescriptor<AssistantActivityStatusCode> {
+  const recovery = step.providerRecovery
+  const code = step.label.code
+  const waiting = recovery?.phase === 'retry_wait' || /provider\.(rateLimited|retryWait|overloaded)/.test(code)
+  if (waiting) {
+    const reason = recovery?.reason ?? (code.includes('rateLimited') ? 'rate_limited' : 'unknown')
+    const name = reason === 'rate_limited' ? 'rateLimited' : reason === 'provider_overloaded' ? 'overloaded' : 'retryWait'
+    if (!step.isCurrent) return codeDescriptor(`chat.activity.provider.${name}Past`)
+    const seconds = announce ? null : providerActivityRemainingSeconds(step, nowMs)
+    if (seconds !== null) return codeDescriptor(`chat.activity.provider.${name}`, { seconds })
+    return codeDescriptor(name === 'retryWait' ? 'chat.activity.provider.retryWaiting' : `chat.activity.provider.${name}Waiting`)
   }
-  const initialSeconds = Number(step.label.params.seconds ?? 0)
-  if (!Number.isFinite(initialSeconds)) return 0
-  const elapsedSeconds = Math.floor(Math.max(0, nowMs - step.at) / 1000)
-  return Math.max(0, Math.floor(initialSeconds) - elapsedSeconds)
+  if (recovery?.phase === 'fallback' || code === 'chat.activity.provider.fallback') {
+    if (recovery?.model) {
+      if (recovery.fromModel && recovery.fromModel !== recovery.model) {
+        return codeDescriptor(step.isCurrent ? 'chat.activity.provider.fallbackModels' : 'chat.activity.provider.fallbackModelsPast', { from: recovery.fromModel, to: recovery.model })
+      }
+      return codeDescriptor(step.isCurrent ? 'chat.activity.provider.fallbackModel' : 'chat.activity.provider.fallbackModelPast', { model: recovery.model })
+    }
+    return codeDescriptor(step.isCurrent ? 'chat.activity.provider.fallback' : 'chat.activity.provider.fallbackPast')
+  }
+  if (recovery?.phase === 'retrying' || code.startsWith('chat.activity.provider.retrying')) {
+    if (!step.isCurrent) return codeDescriptor('chat.activity.provider.retryingPast')
+    if (!recovery?.attempt) return codeDescriptor('chat.activity.provider.retryingGeneric')
+    return recovery.limit ? codeDescriptor('chat.activity.provider.retrying', { attempt: recovery.attempt, limit: recovery.limit })
+      : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt: recovery.attempt })
+  }
+  return step.label
 }
 
 function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boolean {
@@ -1164,7 +1230,8 @@ function projectStatusSteps(
         at: entry.at,
         activityOrder: entry.activityOrder,
         endedAt: entry.endedAt,
-        isCurrent: entry.state === 'running',
+        isCurrent: entry.state === 'running' && (lifecycle === 'working' || lifecycle === 'answering'),
+        providerRecovery: entry.providerRecovery, httpStatus: entry.httpStatus, failureKind: entry.failureKind,
         id: entry.id,
         category: 'maintenance',
         state: entry.state,
@@ -1189,15 +1256,17 @@ function projectStatusSteps(
     if (
       previous?.label.code === label.code
       && previous.activityOrder === entry.activityOrder
+      && providerRecoveryIdentity(previous.providerRecovery) === providerRecoveryIdentity(entry.providerRecovery)
     ) continue
     steps.push({
-      key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}`)}`,
+      key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}\u001f${entry.activityOrder ?? ''}\u001f${providerRecoveryIdentity(entry.providerRecovery)}`)}`,
       label,
       at: entry.at,
       activityOrder: entry.activityOrder,
       endedAt: entry.endedAt,
       isCurrent: false,
       category: 'phase',
+      providerRecovery: entry.providerRecovery, httpStatus: entry.httpStatus, failureKind: entry.failureKind,
     })
   }
   const mergedSteps = mergeAdjacentAutomaticCompletedMaintenance(steps)

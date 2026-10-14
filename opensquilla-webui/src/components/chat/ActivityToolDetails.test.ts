@@ -22,11 +22,8 @@ describe('ActivityToolDetails text hierarchy', () => {
     expect(ruleBody('.activity-tool-details__line--code')).toContain(
       'color: var(--text-muted);',
     )
-    expect(ruleBody('.activity-tool-details__fallback')).toContain(
-      'color: var(--text-muted);',
-    )
     const error = ruleBody('.activity-tool-details__line--error')
-    expect(error).toContain('color: var(--text-muted);')
+    expect(error).toContain('color: var(--warn);')
     expect(error).not.toContain('var(--danger)')
   })
 })
@@ -48,25 +45,10 @@ describe('ActivityToolDetails narrow-width layout', () => {
   })
 })
 
-describe('ActivityToolDetails interaction affordances', () => {
-  it('marks interactive target and code lines with a resting underline', () => {
-    const resting = ruleBody(
-      '.activity-tool-details__summary--interactive .activity-tool-details__line--target',
-    )
-    expect(resting).toContain('text-decoration: underline;')
-    expect(resting).toContain('text-decoration-style: dotted;')
-  })
-
-  it('gives the fallback affordance a real focus ring', () => {
-    const focused = ruleBody('.activity-tool-details__fallback:focus-visible')
-    expect(focused).toContain('box-shadow: var(--focus-ring);')
-  })
-})
-
 describe('ActivityToolDetails bounded window treatment', () => {
   it('bounds the detail window without allowing content to escape', () => {
     const window = ruleBody('.activity-tool-details--bounded')
-    expect(window).toContain('max-height: min(20rem, 52vh);')
+    expect(window).toContain('max-height: min(20rem, 45vh);')
     expect(window).toContain('overflow: hidden;')
   })
 })

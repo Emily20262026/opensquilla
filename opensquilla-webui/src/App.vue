@@ -53,7 +53,7 @@
         :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
-        <Icon name="plus" :size="16" />
+        <Icon name="plus" :size="17" />
         <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
@@ -70,7 +70,7 @@
         :aria-current="isPrimaryNavActive(item.path) ? 'page' : undefined"
         @click="handleNavClick"
       >
-        <Icon :name="item.icon" :size="16" />
+        <Icon :name="sidebarNavIcons[item.icon] ?? item.icon" :size="17" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
       </router-link>
     </div>
@@ -94,6 +94,7 @@
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
       @rename="onRenameSession"
+      @copy-session-link="onCopySidebarSessionLink"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @reorder="onReorderSidebarSession"
@@ -108,15 +109,16 @@
       @search="openCommandPalette"
     />
 
-    <!-- Fixed footer: settings + connection state -->
+    <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
+      <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
       <button
         type="button"
         class="sidebar-fn-item"
         data-icon="settings"
         @click="openSettings"
       >
-        <Icon name="settings" :size="16" />
+        <Icon name="settings-2" :size="17" />
         <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
       </button>
     </div>
@@ -172,14 +174,21 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <div class="app-workspace">
+      <div
+        v-show="!workbenchMaximized"
+        class="app-chat-pane"
+        :inert="workbenchMaximized || undefined"
+        :aria-hidden="workbenchMaximized ? 'true' : undefined"
+      >
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }" :data-connection-state="effectiveConnectionState">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
           v-show="!appStore.sidebarOpen"
           ref="topbarSidebarToggleRef"
           class="sidebar-dock-toggle topbar-toggle"
-          :aria-label="t('chrome.expandSidebar')"
+          :aria-label="sidebarExpandLabel"
           aria-controls="sidebar-nav"
           :aria-expanded="appStore.sidebarOpen"
           :aria-keyshortcuts="sidebarToggleAriaShortcut"
@@ -188,6 +197,13 @@
           @click="toggleDock('topbar-button')"
         >
           <Icon name="sidebar-hidden" :size="18" />
+          <span
+            v-if="desktopUpdate.visible.value"
+            class="sidebar-update-dot"
+            :data-state="desktopUpdateSeverity"
+            data-testid="sidebar-update-dot"
+            aria-hidden="true"
+          ></span>
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
@@ -213,95 +229,28 @@
           :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          :find-state="chatRouteHeaderFindState"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
-          @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
           @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
-          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
+          @open-find="chatRouteHeader.invoke('openFind')"
+          @update-find-query="chatRouteHeader.invoke('updateFindQuery', $event)"
+          @search-find="chatRouteHeader.invoke('searchFind', $event)"
+          @navigate-find="chatRouteHeader.invoke('navigateFind', $event)"
+          @close-find="chatRouteHeader.invoke('closeFind')"
         />
       </div>
-      <div
-        class="topbar-right"
-        :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
-      >
+      <div class="topbar-right">
         <ChatSystemStatus
-          v-if="isChatRoute"
           :layout="systemHeaderLayout"
           :connection-state="effectiveConnectionState"
           :connection-label="connectionStateLabel"
+          :connection-notice-visible="connectionNoticeVisible"
           :approval-count="appStore.approvalCount"
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopUpdateSettings"
         />
-        <template v-else>
-          <button
-            v-if="appStore.approvalCount > 0"
-            class="approval-inline"
-            @click="openBlockedApprovalSession"
-            :title="t('chrome.openBlockedSession')"
-          >
-            {{ t('chrome.approvalRequired') }}
-          </button>
-          <button
-            v-if="webConfigEnabled"
-            type="button"
-            class="conn-pill conn-pill--link"
-            :class="connectionState"
-            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-            :aria-label="t('chrome.manageConnection')"
-            @click="openConnectionSettings"
-          >{{ connectionStateLabel }}</button>
-          <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
-          <DesktopUpdateIndicator />
-        </template>
-        <LanguageSwitcher />
-        <div class="theme-menu-wrap">
-          <button
-            ref="themeButtonRef"
-            class="btn btn--icon btn--ghost"
-            :title="t('chrome.theme')"
-            :aria-label="t('chrome.theme')"
-            aria-haspopup="menu"
-            :aria-expanded="themeMenuOpen"
-            @click.stop="themeMenuOpen = !themeMenuOpen"
-          >
-            <Icon :name="themeIconName" :size="16" />
-          </button>
-          <div
-            v-if="themeMenuOpen"
-            class="theme-menu"
-            role="menu"
-            :aria-label="t('chrome.theme')"
-            data-chat-topbar-popover="theme"
-          >
-            <button
-              v-for="opt in themeOptions"
-              :key="opt.mode"
-              type="button"
-              class="theme-menu__item"
-              role="menuitemradio"
-              :aria-checked="appStore.theme === opt.mode"
-              @click="pickTheme(opt.mode)"
-            >
-              <Icon :name="opt.icon" :size="15" />
-              <span>{{ opt.labelKey ? t(opt.labelKey) : opt.label }}</span>
-              <Icon v-if="appStore.theme === opt.mode" class="theme-menu__check" name="check" :size="14" />
-            </button>
-            <button
-              type="button"
-              class="theme-menu__item theme-menu__item--more"
-              role="menuitem"
-              :title="t('chrome.moreThemesHint')"
-              @click="openMoreThemes"
-            >
-              <Icon name="chevronRight" :size="15" />
-              <span>{{ t('chrome.moreThemes') }}</span>
-              <Icon v-if="isCustomThemeActive" class="theme-menu__check" name="check" :size="14" />
-            </button>
-          </div>
-        </div>
         <WorkbenchToggle
           v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
@@ -311,7 +260,6 @@
         />
       </div>
     </header>
-    <div class="app-workspace">
       <main
         v-show="!workbenchMaximized"
         :inert="workbenchMaximized || undefined"
@@ -344,6 +292,7 @@
           <router-view v-if="settingsBackgroundRoute" />
         </ErrorBoundary>
       </main>
+      </div>
       <AppWorkbench
         :enabled="appStore.features.artifactWorkbench === true"
         :workbench-resources-enabled="(
@@ -351,6 +300,7 @@
           || appStore.features.artifactPromptAnnotations === true
         )"
         :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
+        :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
         :modal-blocked="workbenchModalBlocked"
@@ -398,7 +348,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost />
+    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
   </Teleport>
 
   <ConfirmModal />
@@ -450,7 +400,9 @@ import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/setti
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
-import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
+import { copyTextWithFallback } from '@/utils/browser'
+import { currentSessionLink } from '@/utils/chat/sessionLinks'
+import { useAppStore, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
@@ -468,6 +420,7 @@ import {
   type SidebarSectionRow,
 } from './composables/useSessions'
 import Icon from './components/Icon.vue'
+import type { IconName } from './utils/icons'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
@@ -475,25 +428,25 @@ import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDia
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
-import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import SidebarDesktopUpdate from './components/SidebarDesktopUpdate.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
-import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
+import { CONNECTION_NOTICE_DELAY_MS, useDelayedNotice } from './composables/useDelayedNotice'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
   provideChatTopbarPopoverCoordinator,
-  useChatTopbarPopoverCoordination,
 } from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import {
@@ -508,10 +461,9 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
-import { reminderToastPreview } from './utils/cron/notifications'
+import { notifyCronRunFinished } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
@@ -529,7 +481,6 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
-import { markCronFinishNotified } from './utils/cron/notifications'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
 import {
   CRON_SCHEDULER_KEY,
@@ -584,7 +535,7 @@ const workbenchMaximized = computed(() => isChatRoute.value
   && appStore.features.artifactWorkbench === true
   && workbenchStore.expanded && workbenchStore.maximized)
 const topbarPopoverCoordinationEnabled = ref(true)
-const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
@@ -600,6 +551,7 @@ const {
   hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
+  findState: chatRouteHeaderFindState,
 } = chatRouteHeader.model
 const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
 watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })
@@ -664,6 +616,14 @@ const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewa
   : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
   ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
   : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
+// Only the presentation waits. RPC readiness, sending and recovery keep using
+// their real state. A rejected connection cannot recover silently, so show it now.
+const connectionNoticeVisible = useDelayedNotice(
+  computed(() => effectiveConnectionState.value !== 'connected'),
+  computed(() => gatewayAccess.connectionBlocked === true),
+  computed(() => gatewayAccess.isRuntimeStarting),
+  CONNECTION_NOTICE_DELAY_MS,
+)
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -682,6 +642,11 @@ const {
   applyConfirmedTitle,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
+const sidebarNavIcons: Partial<Record<IconName, IconName>> = {
+  skills: 'sparkles',
+  cron: 'clock-3',
+  usage: 'chart-no-axes-column',
+}
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -717,44 +682,26 @@ watch(
   },
 )
 const desktopUpdate = useDesktopUpdate()
+const { summary: desktopUpdateSummary, severity: desktopUpdateSeverity } = useDesktopUpdatePresentation(desktopUpdate)
+const sidebarExpandLabel = computed(() => desktopUpdate.visible.value
+  ? `${t('chrome.expandSidebar')}, ${desktopUpdateSummary.value}`
+  : t('chrome.expandSidebar'))
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 let cronFinishedSubscription: CronSubscription | null = null
 
 function handleCronRunFinished(event: CronRunFinished) {
-  const runId = typeof event.runId === 'string' ? event.runId : ''
-  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
-  markCronFinishNotified(runId)
-  if (event.success === false) {
-    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
-      tone: 'danger',
-      duration: 9_000,
-    })
-    return
-  }
-  const reminder = event.payloadKind === 'reminder'
-    ? reminderToastPreview(event.summary)
-    : ''
-  if (reminder) {
-    const sessionKey = event.sessionKey?.trim() || ''
-    pushToast(t('cronSkills.jobs.toastBackgroundReminder', {
-      name: jobName,
-      reminder,
-    }), {
-      tone: 'ok',
-      duration: 10_000,
-      action: sessionKey
-        ? {
-            label: t('cronSkills.jobs.toastViewReminder'),
-            onClick: () => switchToSession(sessionKey, 'cron.reminder_toast'),
-          }
-        : undefined,
-    })
-    return
-  }
-  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
-    tone: 'ok',
-    duration: 7_000,
+  notifyCronRunFinished(event, {
+    t,
+    pushToast,
+    openJob: async jobId => {
+      const failure = await router.push({ path: '/cron', query: jobId ? { job: jobId } : {} })
+      return !failure
+    },
+    openSession: async sessionKey => {
+      await switchToSession(sessionKey, 'cron.reminder_toast')
+      return $route.path === '/chat' && $route.query.session === sessionKey
+    },
   })
 }
 
@@ -801,54 +748,6 @@ const sidebarToggleAriaShortcut = computed(() => {
   return parts.join('+')
 })
 
-const themeIconName = computed(() => {
-  if (appStore.theme === 'system') return 'monitor'
-  const active = getManifest(appStore.resolvedTheme)
-  return active?.icon ?? (appStore.resolvedTheme === 'dark' ? 'moon' : 'sun')
-})
-
-const themeMenuOpen = ref(false)
-useChatTopbarPopoverCoordination(
-  'theme',
-  themeMenuOpen,
-  topbarPopoverCoordinator,
-)
-const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
-const themeButtonRef = ref<HTMLButtonElement | null>(null)
-
-// The compact topbar menu deliberately lists only the basic modes (Light / Dark
-// / System). Custom value themes live in Settings → Appearance, reached via the
-// "More themes…" action below — see themePickerOptions({ scope }) in registry.ts.
-const themeOptions = themePickerOptions({ scope: 'basic' })
-
-// A custom value theme (chosen in Settings) is active but not shown in the basic
-// topbar menu; mark "More themes…" instead of leaving no selection indicator.
-const isCustomThemeActive = computed(
-  () => !themeOptions.some((o) => o.mode === appStore.theme),
-)
-
-function pickTheme(mode: ThemeMode) {
-  appStore.setTheme(mode)
-  themeMenuOpen.value = false
-  themeButtonRef.value?.focus()
-}
-
-// "More themes…": the full theme list lives in Settings → Appearance. Close the
-// menu and deep-link straight to that section.
-function openMoreThemes() {
-  themeMenuOpen.value = false
-  handleNavClick()
-  router.push('/settings/interface')
-}
-
-useDocumentEvent('click', (e) => {
-  if (!themeMenuOpen.value) return
-  const wrap = themeButtonRef.value?.closest('.theme-menu-wrap')
-  if (wrap && e.target instanceof Node && !wrap.contains(e.target)) {
-    themeMenuOpen.value = false
-  }
-})
-
 // Current session key from ChatView via URL
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
@@ -880,15 +779,14 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
   immediate: true,
 })
 
-// Chat layout applies to both the session view and the draft route.
+// Shared status controls use the actual topbar geometry on every route.
 const systemHeaderPressureCount = computed(() => (
-  Number(effectiveConnectionState.value !== 'connected')
+  Number(connectionNoticeVisible.value)
   + Number(appStore.approvalCount > 0)
-  + Number(desktopUpdate.visible.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
-  active: isChatRoute,
+  active: computed(() => true),
   pressureCount: systemHeaderPressureCount,
 })
 const activeProjectDraftId = computed(() =>
@@ -927,7 +825,6 @@ const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
 const workbenchModalBlocked = computed(() =>
   commandPaletteOpen.value
-  || themeMenuOpen.value
   || settingsOverlayOpen.value
   || (appStore.sidebarOpen && isSidebarDrawer.value))
 
@@ -1600,8 +1497,8 @@ function onPaletteOpenSettings() {
 }
 
 function onPaletteToggleTheme() {
-  // Cycle the appearance mode through the same registry-driven order as the
-  // topbar picker (every selectable value theme + system), so the palette
+  // Cycle the appearance mode through the registry-driven order used by
+  // Settings (every selectable value theme + system), so the palette
   // never resets a custom theme back to 'light'.
   appStore.cycleTheme()
 }
@@ -1619,6 +1516,30 @@ async function switchToSession(key: string, source = 'app.switchToSession') {
   })
   await router.push({ path: '/chat', query: { session: key } })
   if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
+}
+
+let sidebarCopySequence = 0
+let sidebarClipboardWrite: Promise<void> = Promise.resolve()
+async function onCopySidebarSessionLink(key: string) {
+  if (!key) return
+  const sequence = ++sidebarCopySequence
+  const epoch = gatewayAccess.subscriptionEpoch
+  const isCurrent = () => sequence === sidebarCopySequence
+    && gatewayAccess.subscriptionEpoch === epoch
+  try {
+    const link = await currentSessionLink(key, platform)
+    if (!isCurrent()) return
+    // Clipboard fallbacks can settle after a newer click. Serialize the writes,
+    // then recheck ownership so an old fallback cannot overwrite the new link.
+    const write = sidebarClipboardWrite.then(async () => {
+      if (isCurrent()) await copyTextWithFallback(link)
+    })
+    sidebarClipboardWrite = write.catch(() => undefined)
+    await write
+    if (isCurrent()) pushToast(t('chat.copied'), { tone: 'ok' })
+  } catch {
+    if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
 }
 
 // Only the current rename may update local display state. Later authoritative
@@ -1767,9 +1688,9 @@ function openConnectionSettings() {
   router.push('/settings/gateway#connection')
 }
 
-// Compact chat headers hand off to the complete Desktop update workflow rather
-// than recreating update actions inside the status summary.
+// The sidebar entry hands off to the complete Desktop update workflow.
 function openDesktopUpdateSettings() {
+  handleNavClick()
   router.push('/settings/gateway#updates')
 }
 
@@ -1856,6 +1777,9 @@ watch(
 )
 
 function handleKeydown(e: KeyboardEvent) {
+  // Scoped handlers (chat find, editors and IME input) own consumed keys even
+  // when a user has rebound a global action to the same combination.
+  if (e.defaultPrevented) return
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
   // elsewhere — and require the other modifier to be absent — so we never match
   // macOS' Ctrl+K (emacs kill-to-end-of-line inside text fields). preventDefault
@@ -1901,12 +1825,6 @@ function handleKeydown(e: KeyboardEvent) {
   // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
-    e.preventDefault()
-    themeMenuOpen.value = false
-    themeButtonRef.value?.focus()
-    return
-  }
   // Child topbar controls and routed dialogs install their Escape handlers
   // after App's listener. Let the current dialog-stack owner handle the key
   // instead of pre-emptively collapsing the mobile sidebar beneath it.
@@ -2064,6 +1982,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  sidebarCopySequence += 1
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
@@ -2088,6 +2007,7 @@ onUnmounted(() => {
 
 <style scoped>
 .app-workspace {
+  --workspace-header-height: 49px;
   position: relative;
   display: flex;
   min-width: 0;
@@ -2095,18 +2015,53 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Topbar connection pill as a button (web): inherits the base .conn-pill look
-   and state colors, adds button reset + an affordance that it is clickable. */
-.conn-pill--link {
-  cursor: pointer;
-  font-family: inherit;
+.app-chat-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
-.conn-pill--link:hover {
-  filter: brightness(1.08);
+
+.app-chat-pane > .content {
+  min-height: 0;
 }
-.conn-pill--link:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 2px;
+
+.topbar--chat {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+}
+
+.sidebar-core {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+  margin-bottom: var(--sp-2);
+}
+
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-1);
+}
+
+.sidebar-foot .sidebar-fn-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar-update-dot {
+  position: absolute;
+  top: 5px;
+  inset-inline-end: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  border: 1px solid var(--bg-surface);
+}
+
+.sidebar-update-dot[data-state='danger'] {
+  background: var(--danger);
 }
 
 /* Off-screen but screen-reader-reachable announcer for the approval count. */

@@ -1,9 +1,15 @@
 <template>
   <WorkbenchHost
+    ref="hostHandle"
+    :tab-info="tabInfo"
+    :show-toolbar="Boolean(store.activeItem && (showArtifactNavigation(store.activeItem) || visiblePanelToolbarItems(store.activeItem).length))"
+    @tab-menu="openTabMenu"
     :enabled="enabled"
     :allow-empty="Boolean(nativeApi)"
     :route-active="routeActive && store.activeSessionId === (sessionId || null)"
-    :modal-blocked="surfaceBlocked"
+    :modal-blocked="modalBlocked"
+    :native-blocked="surfaceBlocked"
+    :native-snapshot-url="nativeSnapshotUrl"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
     :open-items-label="t('workbench.openItems')"
@@ -38,7 +44,7 @@
 
     <template #actions="{ item }">
       <button
-        v-if="nativeApi"
+        v-if="nativeApi && (!item || item.kind === 'browser')"
         type="button"
         class="app-workbench__action"
         :aria-label="t('workbench.browser.newTab')"
@@ -48,11 +54,17 @@
       >
         <Icon name="plus" :size="16" aria-hidden="true" />
       </button>
-      <ResourceActionsMenu v-if="item && resourceActionArtifact(item)" :key="item.id"
-        :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
-        :previewable="false" trigger />
+      <button v-if="item" type="button" class="app-workbench__action"
+        :aria-label="t('resourceActions.more')" :title="t('resourceActions.more')" aria-haspopup="menu"
+        data-testid="workbench-tab-actions" @click="openTabMenu(item, $event)"
+        @keydown="onMenuTriggerKey(item, $event)">
+        <Icon name="moreHorizontal" :size="16" aria-hidden="true" />
+      </button>
+    </template>
+
+    <template #toolbar="{ item }">
       <select
-        v-if="artifactNavigationItems(item).length > 1"
+        v-if="showArtifactNavigation(item)"
         class="app-workbench__switcher"
         :value="item?.id"
         :aria-label="t('chat.sessionDeliverables')"
@@ -69,7 +81,7 @@
         </option>
       </select>
       <template
-        v-for="toolbarItem in panelToolbarItems(item)"
+        v-for="toolbarItem in visiblePanelToolbarItems(item)"
         :key="toolbarItem.id"
       >
         <span
@@ -135,7 +147,10 @@
           v-else
           type="button"
           class="app-workbench__action"
-          :class="{ 'is-active': toolbarItem.pressed }"
+          :class="{
+            'is-active': toolbarItem.pressed,
+            'app-workbench__action--annotation': toolbarItem.id === 'toggle-annotation-mode',
+          }"
           :aria-label="toolbarItem.label"
           :aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)
             ? 'workbench-annotation-mode-status'
@@ -148,10 +163,10 @@
           <Icon :name="toolbarItem.icon" :size="15" aria-hidden="true" />
           <span
             v-if="toolbarItem.id === 'toggle-annotation-mode'"
-            class="app-workbench__action-beta"
+            class="app-workbench__action-label"
             aria-hidden="true"
           >
-            β
+            {{ toolbarItem.label }}
           </span>
         </button>
       </template>
@@ -174,7 +189,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, false)"
-        @workbench-event="handlePanelEvent(item, $event)"
+        v-on="{ 'workbench-event': panelEventHandler(item) }"
       />
       <div v-else class="app-workbench__unsupported">
         {{ t('workbench.empty') }}
@@ -187,10 +202,14 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, true)"
-        @workbench-event="handlePanelEvent(item, $event)"
+        v-on="{ 'workbench-event': panelEventHandler(item) }"
       />
     </template>
   </WorkbenchHost>
+  <ResourceActionsMenu v-if="menuItem" ref="tabMenu" :artifact="resourceActionArtifact(menuItem)"
+    :session-key="sessionKeyFromWorkbenchItem(menuItem)" :previewable="false" compact
+    :download-action="menuDownloadAction"
+    :extra-actions="tabMenuActions" @action="performTabMenuAction" />
 </template>
 
 <script setup lang="ts">
@@ -223,7 +242,7 @@ import type {
   WorkbenchPreviewDescriptor,
   WorkbenchResource,
 } from '@/types/workbenchResources'
-import { workbenchResourceRefId } from '@/types/workbenchResources'
+import { createWorkbenchResourceRef, workbenchResourceRefId } from '@/types/workbenchResources'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import {
   artifactWorkbenchItemId,
@@ -231,6 +250,7 @@ import {
   fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
+  preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
@@ -242,12 +262,12 @@ import {
   type BrowserWorkbenchOpenEventDetail,
 } from '@/workbench/browserItems'
 import { artifactFileTitle } from '@/utils/chat/artifacts'
-import { artifactProductClientError } from '@/utils/artifactProductErrors'
+import { artifactProductClientError, classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   readPreviewPreferences,
   savePreviewPreferences,
 } from '@/utils/workbench/previewPreferences'
-import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
+import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -285,7 +305,7 @@ import type {
   WorkbenchToolbarSelectOption,
   WorkbenchToolbarItem,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import { createArtifactWorkbenchDefinitions, type ArtifactWorkbenchProviderOptions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
 import { requestNativeBrowserClose } from './browserCloseGuard'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
@@ -293,15 +313,19 @@ import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
+import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import BrowserStartPanel from './BrowserStartPanel.vue'
-import { downloadBlob } from '@/utils/browser'
+import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
+import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
+import { createNativeTabSnapshots } from './nativeTabSnapshots'
 
 const props = withDefaults(defineProps<{
   enabled?: boolean
   modalBlocked?: boolean
   workbenchResourcesEnabled?: boolean
   promptAnnotationsEnabled?: boolean
+  officePromptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
 }>(), {
@@ -309,6 +333,7 @@ const props = withDefaults(defineProps<{
   modalBlocked: false,
   workbenchResourcesEnabled: false,
   promptAnnotationsEnabled: false,
+  officePromptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
 })
@@ -324,7 +349,7 @@ const referenceGateway = inject(GATEWAY_ACCESS_KEY, null)
 watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability, referenceGateway?.isLocalOwner], () => {
   // A filesystem snapshot is valid only for the connection that authorized it.
   for (const item of [...store.items]) {
-    if (item.kind === 'file') store.closeItem(item.id, 'scope-changed')
+    if (item.kind === 'file' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
   }
 })
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
@@ -356,10 +381,112 @@ const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
     if (!expanded) restoreWorkbenchFocus()
   },
 })
+const hostHandle = ref<{ closeItem(id: string): Promise<void>; closeOtherItems(id: string): Promise<void>; hideHover(): void } | null>(null)
+const tabMenu = ref<{ show(event: MouseEvent | KeyboardEvent, artifact?: ArtifactPayload): Promise<void>; cancel(): void } | null>(null)
+const menuItemId = ref<string | null>(null)
+const menuItem = computed(() => store.visibleItems.find(item => item.id === menuItemId.value) ?? null)
+const menuDownloadAction = computed(() => panelToolbarItems(menuItem.value)
+  .some(action => action.kind === 'action' && action.id === 'download') ? 'panel:download' : undefined)
+const thumbnailCache = createTabThumbnailCache()
+const thumbnailVersion = ref(0)
+const nativeArtifactSnapshots = createNativeTabSnapshots(nativeApi, () => { thumbnailVersion.value++ })
+const nativeSnapshotUrl = computed(() => {
+  void thumbnailVersion.value
+  const item = store.activeItem
+  if (!item) return undefined
+  const state = runtimeManager.getRenderState(item.id)
+  if (state.errorMessage || ['error', 'crashed', 'offline', 'unsupported'].includes(String(state.nativeSurfaceState))) return undefined
+  if (typeof state.snapshotUrl === 'string') return state.snapshotUrl
+  return nativeArtifactSnapshots.snapshot(item.id, thumbnailFingerprint(item)) || tabInfo(item).thumbnailUrl
+})
+function thumbnailFingerprint(item: WorkbenchItem) {
+  const artifact = artifactFromWorkbenchItem(item)
+  const prepared = preparedPreviewFromWorkbenchItem(item)
+  // Mutable documents render the store's head without replacing their tab item.
+  // Prepared attachment/deliverable previews remain pinned to their own bytes.
+  const workspace = artifact && !(prepared && prepared.resource.type !== 'document')
+    ? artifactDocuments.snapshot(artifact, sessionKeyFromWorkbenchItem(item)).workspace
+    : null
+  const head = workspace?.source === 'document-api' ? workspace.headArtifact : artifact
+  return [head?.revisionId, head?.sha256, head?.download_url, head?.revision_download_url, artifact?.previewPagePath].join(':')
+}
+function tabInfo(item: WorkbenchItem) {
+  void thumbnailVersion.value
+  const state = runtimeManager.getRenderState(item.id)
+  return {
+    subtitle: panelHeader(item).subtitle,
+    loading: item.kind === 'browser' && state.loading === true,
+    thumbnailUrl: typeof state.thumbnailUrl === 'string' ? state.thumbnailUrl
+      : nativeArtifactSnapshots.get(item.id, thumbnailFingerprint(item))
+        || thumbnailCache.get(item.id, thumbnailFingerprint(item)),
+  }
+}
+const tabMenuActions = computed(() => {
+  const item = menuItem.value
+  if (!item) return []
+  const actions: { id: string; label: string; disabled?: boolean; separator?: boolean }[] = []
+  if (item.kind === 'browser') {
+    const state = runtimeManager.getRenderState(item.id)
+    const loading = state.loading === true
+    const url = normalizeBrowserUrl(String(state.currentUrl || item.payload.initialUrl || ''))
+    actions.push(
+      { id: loading ? 'stop' : 'reload', label: t(loading ? 'workbench.browser.stop' : 'workbench.refresh') },
+      { id: 'copy-link', label: t('workbench.tabs.copyLink'), disabled: !url },
+      { id: 'open-external', label: t('workbench.openExternal'), disabled: !url },
+    )
+  } else {
+    const refresh = panelToolbarItems(item).find(action => action.kind === 'action' && action.id === 'refresh')
+    if (refresh?.kind === 'action') actions.push({ id: 'panel:refresh', label: refresh.label, disabled: refresh.disabled })
+    const external = panelToolbarItems(item).find(action => action.kind === 'action' && action.id === 'open-external')
+    if (external?.kind === 'action') actions.push({ id: 'panel:open-external', label: external.label, disabled: external.disabled })
+    if (nativeApi) actions.push({ id: 'open-web', label: t('workbench.tabs.openWeb') })
+  }
+  actions.push({ id: 'close', label: t('workbench.closeItem'), separator: Boolean(actions.length || resourceActionArtifact(item)) })
+  if (store.visibleItems.length > 1) actions.push({ id: 'close-others', label: t('workbench.tabs.closeOthers') })
+  return actions
+})
+async function openTabMenu(item: WorkbenchItem, event: MouseEvent | KeyboardEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  hostHandle.value?.hideHover()
+  menuItemId.value = item.id
+  await nextTick()
+  if (menuItem.value?.id === item.id) await tabMenu.value?.show(event, resourceActionArtifact(item))
+}
+function onMenuTriggerKey(item: WorkbenchItem, event: KeyboardEvent) {
+  if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10') void openTabMenu(item, event)
+}
+async function performTabMenuAction(action: string) {
+  const item = menuItem.value
+  if (!item) return
+  if (action === 'close') { await hostHandle.value?.closeItem(item.id); return }
+  if (action === 'close-others') { await hostHandle.value?.closeOtherItems(item.id); return }
+  if (action === 'open-web') { openBrowserStart(); return }
+  if (['panel:open-external', 'panel:download', 'panel:refresh'].includes(action)) {
+    runtimeManager.performAction(item, action.slice('panel:'.length)); return
+  }
+  if (item.kind !== 'browser') return
+  if (action === 'copy-link') {
+    const state = runtimeManager.getRenderState(item.id)
+    const url = normalizeBrowserUrl(String(state.currentUrl || item.payload.initialUrl || ''))
+    if (!url) return
+    try { await copyTextWithFallback(url); pushToast(t('chat.copied'), { tone: 'ok' }) }
+    catch { pushToast(t('resourceActions.failed'), { tone: 'danger' }) }
+    return
+  }
+  runtimeManager.performAction(item, action)
+}
+watch(() => store.items.map(item => item.id), ids => {
+  thumbnailCache.prune(new Set(ids))
+  nativeArtifactSnapshots.prune(new Set(ids))
+  thumbnailVersion.value++
+})
+watch(() => store.activeSessionId, () => { tabMenu.value?.cancel(); menuItemId.value = null })
 let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
 let scopeChangeGeneration = 0
+let artifactNavigationGeneration = 0
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ): WorkbenchItem {
@@ -469,11 +596,7 @@ function onBrowserWorkbenchOpen(event: Event) {
   }
 }
 
-for (const definition of createArtifactWorkbenchDefinitions({
-  artifactContent: artifactWorkbench.content,
-  artifactPreviews: artifactWorkbench.previews,
-  artifactDocuments,
-  promptAnnotations: props.promptAnnotationsEnabled ? {
+const promptAnnotationActions: NonNullable<ArtifactWorkbenchProviderOptions['promptAnnotations']> = {
     create: request => artifactPromptAnnotations.create(request),
     update: (annotationId, body) => artifactPromptAnnotations.update(annotationId, body),
     discard: annotationId => artifactPromptAnnotations.discard(annotationId),
@@ -489,7 +612,14 @@ for (const definition of createArtifactWorkbenchDefinitions({
     setActiveDocument: (sessionKey, documentId) => {
       artifactPromptAnnotations.setActiveDocument(sessionKey, documentId)
     },
-  } : undefined,
+}
+
+for (const definition of createArtifactWorkbenchDefinitions({
+  artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
+  artifactDocuments,
+  promptAnnotations: props.promptAnnotationsEnabled ? promptAnnotationActions : undefined,
+  officePromptAnnotations: props.officePromptAnnotationsEnabled ? promptAnnotationActions : undefined,
   baseOrigin,
   confirmPermission: confirmWorkbenchPermission,
   confirmRemoteResources: () => confirm({
@@ -540,6 +670,7 @@ if (workspaceReferences || workspaceFiles) {
     key => String(t(key)),
   ), { replace: true })
 }
+workbenchPanelRegistry.register(createToolHistoryFileDefinition(key => String(t(key)), artifactWorkbench.content), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
 const pageAnnotationSendQueue = new PageAnnotationSendQueue()
 let pageAnnotationSendFlush: Promise<void> | null = null
@@ -585,10 +716,15 @@ function openResourceArtifact(
   }))
 }
 
-async function openWorkbenchResource(resource: WorkbenchResource, item: WorkbenchItem) {
+async function openWorkbenchResource(
+  resource: WorkbenchResource,
+  item: WorkbenchItem,
+  isCurrent: () => boolean = () => true,
+) {
   const sessionKey = resourceSessionKey(item)
-  if (!sessionKey) return
+  if (!sessionKey || !isCurrent()) return
   const current = await workbenchResources.openCurrent(sessionKey, resource)
+  if (!isCurrent()) return
   if (current?.disposition === 'document') {
     refreshResourceCollectionItem(sessionKey)
     const artifact = artifactPayloadFromRevision(current.revision)
@@ -611,7 +747,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
     && resource.capabilities.edit
     && resource.sha256
   ) {
-    await importWorkbenchResourceForSession(resource, sessionKey)
+    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent)
     return
   }
   const readonlyResource = current?.resource || resource
@@ -644,6 +780,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
     return
   }
   const preview = await workbenchResources.preview(sessionKey, readonlyResource.resource)
+  if (!isCurrent()) return
   const resolved = preview ? resourceFromPreparedPreview(preview) : readonlyResource
   openResourceArtifact(
     resolved,
@@ -656,8 +793,11 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
 async function importWorkbenchResourceForSession(
   resource: WorkbenchResource,
   sessionKey: string,
+  isCurrent: () => boolean = () => true,
 ) {
+  if (!isCurrent()) return
   const imported = await workbenchResources.importDocument(sessionKey, resource)
+  if (!isCurrent()) return
   refreshResourceCollectionItem(sessionKey)
   const artifact = artifactPayloadFromRevision(imported.revision)
   artifact.documentId = imported.document.documentId
@@ -846,7 +986,13 @@ function artifactNavigationId(
   return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact)
 }
 
-function selectNavigationArtifact(
+function showArtifactNavigation(item: WorkbenchItem | null): boolean {
+  const artifacts = artifactNavigationItems(item)
+  return Boolean(item && artifacts.length > 1
+    && artifacts.some(artifact => artifactNavigationId(item, artifact) === item.id))
+}
+
+async function selectNavigationArtifact(
   item: WorkbenchItem | null,
   event: Event,
 ) {
@@ -856,8 +1002,46 @@ function selectNavigationArtifact(
     candidate => artifactNavigationId(item, candidate) === select.value,
   )
   if (!artifact || select.value === item.id) return
+  // The active item changes only after a successful open, including canonical
+  // document resolution. Keep failed requests from looking like a selection.
+  select.value = item.id
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
+  const navigationGeneration = ++artifactNavigationGeneration
+  const scopeGeneration = scopeChangeGeneration
+  const isCurrent = () => navigationGeneration === artifactNavigationGeneration
+    && scopeGeneration === scopeChangeGeneration
+    && props.routeActive && props.sessionId === sessionKey
+    && store.activeSessionId === sessionKey && store.activeItemId === item.id
+    && store.items.some(candidate => candidate.id === item.id)
+  if (!isCurrent()) return
+  const kind = artifactWorkbenchPreviewKind(artifact)
+  const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
+  const documentId = typeof artifact.documentId === 'string'
+    ? artifact.documentId.trim()
+    : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
+  if (props.workbenchResourcesEnabled && sessionKey && (artifactId || documentId)
+    && (kind === 'html' || isOfficePreviewFormat(kind))) {
+    try {
+      const resource = await workbenchResources.resolve(sessionKey, createWorkbenchResourceRef(
+        documentId ? 'document' : 'deliverable', documentId || artifactId,
+      ))
+      if (!isCurrent()) return
+      if (resource) {
+        await openWorkbenchResource(resource, item, isCurrent)
+        return
+      }
+      // A Gateway without the resource API retains the established legacy path.
+    } catch (error) {
+      if (!isCurrent()) return
+      const classified = classifyArtifactProductError(error)
+      const translated = t(classified.messageKey)
+      pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated,
+        { tone: 'danger', duration: 9000 })
+      return
+    }
+  }
+  if (!isCurrent()) return
   store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
@@ -895,6 +1079,13 @@ function panelToolbarItems(
   ) || []
 }
 
+function visiblePanelToolbarItems(item: WorkbenchItem | null): readonly WorkbenchToolbarItem[] {
+  const toolbar = panelToolbarItems(item)
+  return item?.kind === 'artifact-preview'
+    ? toolbar.filter(action => !['open-external', 'download', 'refresh'].includes(action.id))
+    : toolbar
+}
+
 function resourceActionArtifact(item: WorkbenchItem): ArtifactPayload | undefined {
   return fileActionArtifactFromWorkbenchItem(item, runtimeManager.getRenderState(item.id))
 }
@@ -913,7 +1104,26 @@ function panelRefSetter(item: WorkbenchItem): (value: unknown) => void {
   return value => setPanelHandle(item, value)
 }
 
+function panelEventHandler(item: WorkbenchItem) {
+  const renderedFingerprint = thumbnailFingerprint(item)
+  return (event: WorkbenchComponentEvent) => {
+    // Store updates precede Vue's prop update. A pending old renderer can still
+    // emit in that gap, so bind its image to the revision rendered by this slot.
+    if (event.type === 'preview-thumbnail' && renderedFingerprint !== thumbnailFingerprint(item)) return
+    handlePanelEvent(item, event)
+  }
+}
+
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {
+  if (event.type === 'preview-thumbnail' && event.payload instanceof Blob) {
+    // The Office navigator already rendered this image for the visible document.
+    // Store a bounded independent URL so closing its renderer cannot break the tab card.
+    if (store.items.some(candidate => candidate.id === item.id)) {
+      thumbnailCache.save(item.id, thumbnailFingerprint(item), event.payload)
+      thumbnailVersion.value++
+    }
+    return
+  }
   if (event.type === 'request-collapse') {
     store.setExpanded(false)
     restoreWorkbenchFocus()
@@ -1007,6 +1217,13 @@ function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
     }
   }
   runtimeManager.handleNativeSurfaceEvent(event)
+  if (browserItem?.kind === 'artifact-preview' && browserItem.hostKind === 'native-webcontents') {
+    if (event.type === 'loading' || event.type === 'error' || event.type === 'crashed') {
+      nativeArtifactSnapshots.invalidate(browserItem.id, event.type === 'loading')
+    } else if (event.type === 'ready' && store.activeItemId === browserItem.id && store.isVisible) {
+      void nativeArtifactSnapshots.ready(browserItem.id, thumbnailFingerprint(browserItem))
+    }
+  }
 }
 
 function onArtifactState(event: ArtifactDocumentChange) {
@@ -1069,7 +1286,7 @@ async function activatePromptAnnotationItem(
 
 async function onPromptAnnotationFocus(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationFocusDetail>).detail
-  if (!detail?.annotationId || !detail.documentId || !detail.sessionKey) {
+  if (!props.promptAnnotationsEnabled || !detail?.annotationId || !detail.documentId || !detail.sessionKey) {
     detail?.complete?.(false)
     return
   }
@@ -1097,7 +1314,8 @@ async function onPromptAnnotationFocus(event: Event) {
 async function onPromptAnnotationReuse(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationReuseDetail>).detail
   if (
-    !detail?.documentId
+    !props.promptAnnotationsEnabled
+    || !detail?.documentId
     || !detail.sessionKey
     || !detail.body.trim()
     || detail.body.length > 16 * 1024
@@ -1298,6 +1516,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  thumbnailCache.clear()
+  nativeArtifactSnapshots.clear()
+  artifactNavigationGeneration += 1
   stopPromptAnnotationLifecycle()
   pageAnnotationSendQueue.clear()
   if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
@@ -1373,18 +1594,6 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.app-workbench__action-beta {
-  position: absolute;
-  top: 3px;
-  right: 3px;
-  color: currentColor;
-  font-size: 7px;
-  font-weight: 600;
-  line-height: 1;
-  opacity: 0.58;
-  pointer-events: none;
-}
-
 .app-workbench__switcher {
   width: min(150px, 24vw);
   min-width: 84px;
@@ -1427,6 +1636,27 @@ onBeforeUnmount(() => {
 
 .app-workbench__action.is-active {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+}
+
+.app-workbench__action--annotation {
+  width: auto;
+  flex: 0 0 auto;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.app-workbench__action--annotation:hover,
+.app-workbench__action--annotation.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
 }
 

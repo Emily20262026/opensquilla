@@ -108,6 +108,7 @@
                 type="button"
                 class="chat-prompt-annotation-chip__main"
                 :title="annotation.body"
+                :disabled="Boolean(annotation.selection)"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
                 <span class="chat-prompt-annotation-chip__target">
@@ -453,7 +454,7 @@
             <span
               ref="sendControlEl"
               class="chat-send-control"
-              :class="{ 'is-hint-dismissed': sendHintDismissed }"
+              :class="{ 'is-hint-dismissed': sendHintDismissed, 'is-hint-requested': sendHintRequested }"
               :tabindex="sendControlHint ? 0 : undefined"
               :role="sendControlHint ? 'group' : undefined"
               :aria-label="sendControlHint ? t('chat.send') : undefined"
@@ -463,40 +464,38 @@
               @pointerdown="focusSendHint"
               @keydown.esc="dismissSendHint"
             >
-              <Transition name="composer-ctl" mode="out-in">
-                <button
-                  v-if="canStop && !showSkillQueueSend"
-                  key="stop"
-                  class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
-                  :disabled="stopPending"
-                  :aria-busy="stopPending || undefined"
-                  :title="stopTargetsPlanRun
-                    ? t('chat.planRun.stopExecutionEsc')
-                    : t('chat.stopResponseEsc')"
-                  :aria-label="stopTargetsPlanRun
-                    ? t('chat.planRun.stopExecution')
-                    : t('chat.stopResponse')"
-                  @click="emit('stop')"
-                >
-                  <Icon name="stop" :size="16" />
-                </button>
-                <button
-                  v-else
-                  key="send"
-                  class="btn btn--icon btn--primary chat-send-btn"
-                  :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled }"
-                  :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
-                    : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
-                  :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-                  :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
-                  :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
-                  :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
-                  @click="emit('send')"
-                >
-                  <LoadingSpinner v-if="sendPending" />
-                  <Icon v-else name="arrowUp" :size="17" />
-                </button>
-              </Transition>
+              <button
+                v-if="(canStop || showStop) && !showSkillQueueSend"
+                key="stop"
+                class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
+                :disabled="stopPending || !canStop"
+                :aria-busy="stopPending || !canStop || undefined"
+                :title="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecutionEsc')
+                  : t('chat.stopResponseEsc')"
+                :aria-label="stopTargetsPlanRun
+                  ? t('chat.planRun.stopExecution')
+                  : t('chat.stopResponse')"
+                @click="canStop && !stopPending && emit('stop')"
+              >
+                <Icon name="stop" :size="16" />
+              </button>
+              <button
+                v-else
+                key="send"
+                class="btn btn--icon btn--primary chat-send-btn"
+                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled }"
+                :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
+                  : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
+                :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+                :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
+                @click="emit('send')"
+              >
+                <LoadingSpinner v-if="sendPending" />
+                <Icon v-else name="arrowUp" :size="17" />
+              </button>
               <span
                 v-if="sendControlHint"
                 id="chat-composer-send-tooltip"
@@ -508,9 +507,7 @@
           </div>
         </div>
       </div>
-      <div class="chat-collapse-region chat-collapse-region--disclaimer">
-        <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
-      </div>
+      <p v-if="isNewLanding" class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
     </div>
     <input
       ref="fileInputEl"
@@ -557,6 +554,7 @@ interface ChatComposerExpose {
   focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
+  showSendBlockedHint: () => void
 }
 
 const props = withDefaults(defineProps<{
@@ -573,6 +571,8 @@ const props = withDefaults(defineProps<{
   sendDisabled?: boolean
   isStreaming: boolean
   canStop: boolean
+  /** Retain the current task's shape during recovery; never grants Stop permission. */
+  showStop?: boolean
   stopTargetsPlanRun?: boolean
   stopPending?: boolean
   isNewLanding: boolean
@@ -580,6 +580,8 @@ const props = withDefaults(defineProps<{
   sendButtonTitle: string
   sendBlockedMessage?: string
   showImageInputWarning?: boolean
+  /** Opt in only when the blocking reason has no existing inline explanation. */
+  showSendBlockedTooltip?: boolean
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
@@ -695,11 +697,19 @@ const showSkillQueueSend = computed(() => props.canStop
   && props.selectedSkills.length > 0
   && props.hasSendContent)
 
-const sendControlHint = computed(() => props.showImageInputWarning
+const sendControlHint = computed(() => (props.showImageInputWarning || props.showSendBlockedTooltip)
   && (!props.canStop || showSkillQueueSend.value)
   ? props.sendBlockedMessage || '' : '')
 const sendHintDismissed = ref(false)
+const sendHintRequested = ref(false)
 const sendControlEl = ref<HTMLElement | null>(null)
+
+function showSendBlockedHint() {
+  if (!sendControlHint.value) return
+  // Enter stays in the editor: reuse the same hint without moving its caret.
+  sendHintDismissed.value = false
+  sendHintRequested.value = true
+}
 
 function focusSendHint(event: PointerEvent) {
   if (!sendControlHint.value || (props.canStop && !showSkillQueueSend.value)) return
@@ -714,6 +724,7 @@ function focusSendHint(event: PointerEvent) {
 function dismissSendHint(event: KeyboardEvent) {
   if (!sendControlHint.value || sendHintDismissed.value) return
   sendHintDismissed.value = true
+  sendHintRequested.value = false
   // Stop can coexist with skill queue Send; preserve its document shortcut.
   if (props.canStop) return
   event.preventDefault()
@@ -724,11 +735,12 @@ useDocumentEvent('keydown', event => {
   if (event.key !== 'Escape') return
   const hint = sendControlEl.value?.querySelector<HTMLElement>('.chat-send-tooltip')
   // Hover does not move focus out of the editor. Close its visible hint before
-  // Escape reaches the editor's clear-draft shortcut; Stop keeps its shortcut.
-  if (hint && getComputedStyle(hint).visibility === 'visible') dismissSendHint(event)
+  // Escape reaches the editor; Stop keeps its shortcut.
+  if (sendHintRequested.value || (hint && getComputedStyle(hint).visibility === 'visible')) dismissSendHint(event)
 }, { capture: true })
 
 const inputText = defineModel<string>({ required: true })
+watch([sendControlHint, inputText], () => { sendHintRequested.value = false })
 const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 
@@ -1077,6 +1089,7 @@ defineExpose<ChatComposerExpose>({
   focusTextarea,
   isTextareaFocused,
   resizeTextarea,
+  showSendBlockedHint,
 })
 </script>
 
@@ -1100,14 +1113,14 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-composer--new-landing {
-  width: min(calc(100% - 48px), 820px);
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   margin: 0 auto;
   padding: 0;
   background: transparent;
 }
 
 .chat-composer-inner {
-  width: min(100%, var(--composer-col, 820px));
+  width: min(100%, var(--composer-col, 800px));
   margin: 0 auto;
 }
 
@@ -1216,37 +1229,6 @@ defineExpose<ChatComposerExpose>({
   font-size: var(--fs-xs);
   line-height: 1.5;
   text-align: center;
-}
-
-/* Transcript content deliberately scrolls underneath the floating dock. The
-   input panel owns its glass surface, but the disclaimer sits outside that
-   panel; give the note its own content-sized surface so translated/wrapped
-   copy never collides visually with a message passing behind it. */
-.chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
-  width: fit-content;
-  max-width: 100%;
-  margin-inline: auto;
-  padding: 0.25rem 0.75rem;
-  border: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
-  box-shadow: 0 8px 20px -16px color-mix(in srgb, var(--text) 32%, transparent);
-  -webkit-backdrop-filter: blur(16px) saturate(125%);
-  backdrop-filter: blur(16px) saturate(125%);
-}
-
-@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
-  .chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
-    background: var(--bg-surface);
-  }
-}
-
-@media (prefers-reduced-transparency: reduce) {
-  .chat-composer--floating .chat-collapse-region--disclaimer > .chat-ai-disclaimer {
-    background: var(--bg-surface);
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
 }
 
 .chat-attachments {
@@ -1845,73 +1827,69 @@ button.attachment-chip__primary:focus-visible {
    both rows the same full width so the fallback remains aligned instead of
    leaving the routing/send cluster floating on a separate edge. */
 @container chat-composer (max-width: 26rem) {
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+  .chat-input-footer {
     flex-direction: column;
     align-items: stretch;
     gap: 0.375rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+  .chat-input-footer > .chat-input-actions {
     width: 100%;
     flex: 0 0 auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+  .chat-input-footer > .chat-input-actions--left {
     flex-wrap: wrap;
     row-gap: 0.25rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+  .chat-input-footer > .chat-input-actions--right {
     align-self: stretch;
     margin-left: 0;
     justify-content: space-between;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+  .chat-input-footer .chat-more-actions-anchor {
     margin-left: auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+  .chat-input-footer .chat-more-actions-menu {
     right: 0;
     left: auto;
   }
 }
 
-/* An active mode adds a chip to the first cluster. Reserve a complete row
-   before that chip can push More onto an isolated line. */
+/* Let the actual controls determine whether another row is needed. A short
+   model name fits beside the left actions even in a split chat column. */
 @container chat-composer (min-width: 26rem) and (max-width: 36rem) {
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+  .chat-input-footer {
     flex-wrap: wrap;
     gap: 0.375rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
-    flex: 1 1 100%;
-  }
-
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+  .chat-input-footer > .chat-input-actions--left {
     flex-wrap: wrap;
     row-gap: 0.25rem;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+  .chat-input-footer > .chat-input-actions--right {
+    flex-grow: 1;
     justify-content: space-between;
     margin-left: 0;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+  .chat-input-footer .chat-more-actions-anchor {
     margin-left: auto;
   }
 
-  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+  .chat-input-footer .chat-more-actions-menu {
     right: 0;
     left: auto;
   }
 }
 
-/* More is the only ordinary-mode popover whose trigger sits at the left edge.
-   Re-anchor it to the footer at narrow widths so the menu stays inside the
-   composer while its labels remain readable. */
+/* Anchor More to the footer at narrow widths so the menu stays inside the
+   composer regardless of which row contains its trigger. */
 @container chat-composer (max-width: 36rem) {
   .chat-input-footer {
     position: relative;
@@ -2278,6 +2256,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-send-control:not(.is-hint-dismissed):hover > .chat-send-tooltip,
+.chat-send-control:not(.is-hint-dismissed).is-hint-requested > .chat-send-tooltip,
 .chat-send-control:not(.is-hint-dismissed):focus-within > .chat-send-tooltip {
   visibility: visible;
 }
@@ -2320,19 +2299,6 @@ button.attachment-chip__primary:focus-visible {
   to { transform: rotate(360deg); }
 }
 
-/* Streaming-only controls (Stop, Queue/Steer) ease in/out at turn boundaries
-   instead of popping into the action cluster. */
-.composer-ctl-enter-active,
-.composer-ctl-leave-active {
-  transition: opacity var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.composer-ctl-enter-from,
-.composer-ctl-leave-to {
-  opacity: 0;
-  transform: scale(0.9);
-}
-
 @media (prefers-reduced-motion: reduce) {
   .chat-composer,
   .chat-collapse-region,
@@ -2342,11 +2308,6 @@ button.attachment-chip__primary:focus-visible {
   }
 
   .chat-run-mode-lock-tip {
-    transition: none;
-  }
-
-  .composer-ctl-enter-active,
-  .composer-ctl-leave-active {
     transition: none;
   }
 }

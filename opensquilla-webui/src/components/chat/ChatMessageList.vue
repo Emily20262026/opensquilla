@@ -34,10 +34,11 @@
         :ref="setRowElement"
         :data-index="entry.index"
         class="chat-message-list__row"
-        :class="{ 'chat-message-list__row--last': entry.index === messages.length - 1 }"
+        :class="{ 'chat-message-list__row--last': entry.index === messages.length - 1, 'chat-message-list__row--find': entry.index === findFallbackIndex }"
         :data-chat-message-key="entry.key"
         :data-chat-message-index="entry.index"
         :data-chat-message-forced="forcedIndexes.has(entry.index) ? 'true' : 'false'"
+        :inert="previewReadOnly || undefined"
         data-testid="chat-message-row"
       >
         <div
@@ -138,8 +139,8 @@
           @toggle-share="$emit('toggleShareMessage', $event)"
           @download-artifact="$emit('downloadArtifact', $event)"
           @open-artifact="$emit('openArtifact', $event)"
-          @toggle-tool-group="$emit('toggleToolGroup', $event)"
-          @toggle-tool-item="$emit('toggleToolItem', $event)"
+          @toggle-tool-group="(id, open) => $emit('toggleToolGroup', id, open)"
+          @toggle-tool-item="(id, open) => $emit('toggleToolItem', id, open)"
           @details-disclosure="(message, open) => $emit('detailsDisclosure', message, open)"
           @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           @open-session="$emit('openSession', $event)"
@@ -220,6 +221,7 @@ import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
 import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
+import type { ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
@@ -235,6 +237,9 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
+  findFallbackIndex?: number
+  /** Cached history cannot authorize actions; fresh live controls stay outside these rows. */
+  previewReadOnly?: boolean
   loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
   selectedMessageIds: Set<string>
@@ -244,8 +249,8 @@ const props = defineProps<{
   subagentSummary: (text: string) => string
   subagentBody: (text: string) => string
   toolCallGroups: (calls: ChatToolCall[], baseKey: string) => ChatToolCallGroup[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
@@ -278,6 +283,11 @@ const props = defineProps<{
   layoutHeader?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
   scrollEpoch?: number
+  restoredViewport?: ChatViewportSnapshot
+  /** Authorized delivery identity; only this scope may reuse completed bodies. */
+  contentCacheScope?: string | null
+  /** Explicit invalidation for reset, deletion, or changed history generation. */
+  contentCacheGeneration?: number
   /** Preview/export paths can force a complete, canonical DOM. */
   virtualizationDisabled?: boolean
   /** Current search match or another externally owned focus target. */
@@ -303,8 +313,8 @@ const emit = defineEmits<{
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
-  toggleToolGroup: [groupId: string]
-  toggleToolItem: [renderKey: string]
+  toggleToolGroup: [groupId: string, open: boolean]
+  toggleToolItem: [renderKey: string, open: boolean]
   detailsDisclosure: [message: ChatRenderedMessage, open: boolean]
   contentHydrated: [message: ChatRenderedMessage, text: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
@@ -437,16 +447,21 @@ let synchronizeScrollOffset: (() => void) | null = null
 const contentRangeCache = inject(HISTORY_CONTENT_READER_KEY, () => new ContentRangeCache())()
 const hydratedContent = reactive(new Map<string, string>())
 const hydratedContentBytes = new Map<string, number>()
+const hydratedContentOwners = new Map<string, { sessionKey: string; reusable: boolean }>()
+const retainedContentSessions = new Map<string, true>()
 let hydratedContentTotalBytes = 0
 const hydrationLoading = reactive(new Set<string>())
 const hydrationErrors = reactive(new Map<string, string>())
 const hydrationControllers = new Map<string, AbortController>()
+const hydrationPromises = new Map<string, Promise<void>>()
 let contentHydrationGeneration = 0
 const hydrationAttempted = new Set<string>()
 const hydrationUnavailable = reactive(new Set<string>())
 let automaticHydrationOwner: { generation: number; key?: string } | undefined
 let contentHydrationDisposed = false
 const MAX_HYDRATED_CONTENT_BYTES = 16 * 1024 * 1024
+const MAX_HYDRATED_CONTENT_ENTRIES = 256
+const MAX_RETAINED_CONTENT_SESSIONS = 6
 
 function contentHydrationKey(message: ChatRenderedMessage, _index: number): string {
   const ref = message.contentRef
@@ -454,11 +469,11 @@ function contentHydrationKey(message: ChatRenderedMessage, _index: number): stri
     // Message ids are only unique inside a session. Include the complete
     // content identity so a reused ChatMessageList cannot install a late
     // response from the previous session or revision.
-    return [
+    return JSON.stringify([
       'content', ref.sessionKey, ref.sessionId, ref.messageId,
       ref.source ?? '', ref.view ?? 'raw', String(ref.byteLength ?? ''),
       ref.revision ?? '', ref.sha256 ?? '', message.contentRevision ?? '',
-    ].join('|')
+    ])
   }
   return chatMessageKey(message, _index)
 }
@@ -535,7 +550,7 @@ function hydrateTimelineText(message: ChatRenderedMessage, text: string): ChatRe
     ? { ...item, html: props.renderMarkdown(item.rawText ?? '') } : item)
 }
 
-function rememberHydratedContent(key: string, text: string): void {
+function rememberHydratedContent(key: string, text: string, message: ChatRenderedMessage): void {
   const previous = hydratedContentBytes.get(key)
   if (previous !== undefined) hydratedContentTotalBytes -= previous
   hydratedContent.delete(key)
@@ -545,8 +560,38 @@ function rememberHydratedContent(key: string, text: string): void {
   hydratedContent.set(key, text)
   hydratedContentBytes.set(key, size)
   hydratedContentTotalBytes += size
+  hydratedContentOwners.set(key, {
+    sessionKey: message.contentRef?.sessionKey ?? props.sessionKey ?? '',
+    // An id/length alone does not prove that the body is still the same after
+    // a return to this session. Old servers without revisions keep local-only
+    // hydration, rather than presenting a potentially changed body as cached.
+    reusable: Boolean(message.contentRef?.revision || message.contentRef?.sha256 || message.contentRevision),
+  })
+  touchRetainedContentSession(message.contentRef?.sessionKey ?? props.sessionKey ?? '')
 
   trimHydratedContent()
+}
+
+function forgetHydratedContent(key: string): void {
+  hydratedContentTotalBytes -= hydratedContentBytes.get(key) ?? 0
+  hydratedContent.delete(key)
+  hydratedContentBytes.delete(key)
+  hydratedContentOwners.delete(key)
+  hydrationAttempted.delete(key)
+}
+
+function touchRetainedContentSession(session: string): void {
+  if (!session) return
+  retainedContentSessions.delete(session)
+  retainedContentSessions.set(session, true)
+  for (const candidate of retainedContentSessions.keys()) {
+    if (retainedContentSessions.size <= MAX_RETAINED_CONTENT_SESSIONS) break
+    if (candidate === props.sessionKey) continue
+    retainedContentSessions.delete(candidate)
+    for (const [key, owner] of hydratedContentOwners) {
+      if (owner.sessionKey === candidate) forgetHydratedContent(key)
+    }
+  }
 }
 
 function mountedContentKeys(): Set<string> {
@@ -559,15 +604,12 @@ function mountedContentKeys(): Set<string> {
 function trimHydratedContent(): void {
   const mounted = mountedContentKeys()
   for (const key of hydratedContent.keys()) {
-    if (hydratedContentTotalBytes <= MAX_HYDRATED_CONTENT_BYTES) break
+    if (hydratedContentTotalBytes <= MAX_HYDRATED_CONTENT_BYTES
+      && hydratedContent.size <= MAX_HYDRATED_CONTENT_ENTRIES) break
     // A cache budget must not replace already displayed full text with a
     // preview. Mounted rows own their bodies until they leave the list.
     if (mounted.has(key)) continue
-    const evicted = hydratedContentBytes.get(key) ?? 0
-    hydratedContent.delete(key)
-    hydratedContentBytes.delete(key)
-    hydrationAttempted.delete(key)
-    hydratedContentTotalBytes -= evicted
+    forgetHydratedContent(key)
   }
 }
 
@@ -579,7 +621,18 @@ function contentHydrationPending(message: ChatRenderedMessage, index: number): b
   return hydrationLoading.has(contentHydrationKey(message, index))
 }
 
-async function hydrateContent(message: ChatRenderedMessage, index: number): Promise<void> {
+function hydrateContent(message: ChatRenderedMessage, index: number): Promise<void> {
+  const key = contentHydrationKey(message, index)
+  const pending = hydrationPromises.get(key)
+  if (pending) return pending
+  const promise = performContentHydration(message, index).finally(() => {
+    if (hydrationPromises.get(key) === promise) hydrationPromises.delete(key)
+  })
+  hydrationPromises.set(key, promise)
+  return promise
+}
+
+async function performContentHydration(message: ChatRenderedMessage, index: number): Promise<void> {
   const ref = contentRefFor(message)
   if (!ref || props.shareMode || !canHydrateContent(message)) return
   const key = contentHydrationKey(message, index)
@@ -599,7 +652,7 @@ async function hydrateContent(message: ChatRenderedMessage, index: number): Prom
       ? await contentRangeCache.readDisplay(ref, { signal: controller.signal })
       : await contentRangeCache.readText(ref, { signal: controller.signal })
     if (generation === contentHydrationGeneration && !controller.signal.aborted) {
-      rememberHydratedContent(key, text)
+      rememberHydratedContent(key, text, message)
       emit('contentHydrated', message, text)
     }
   } catch (error) {
@@ -642,17 +695,28 @@ async function hydrateMountedContent(): Promise<void> {
   }
 }
 
-function resetContentHydrationState(): void {
+function resetContentHydrationState(preserveCompletedBodies = false, invalidatedSession?: string): void {
   contentHydrationGeneration += 1
   for (const controller of hydrationControllers.values()) controller.abort()
   hydrationControllers.clear()
+  hydrationPromises.clear()
   hydrationLoading.clear()
   hydrationErrors.clear()
-  hydratedContent.clear()
   hydrationAttempted.clear()
   hydrationUnavailable.clear()
-  hydratedContentBytes.clear()
-  hydratedContentTotalBytes = 0
+  if (preserveCompletedBodies) {
+    for (const [key, owner] of hydratedContentOwners) {
+      if (!owner.reusable || owner.sessionKey === invalidatedSession) forgetHydratedContent(key)
+    }
+    touchRetainedContentSession(props.sessionKey ?? '')
+    trimHydratedContent()
+  } else {
+    hydratedContent.clear()
+    hydratedContentBytes.clear()
+    hydratedContentOwners.clear()
+    retainedContentSessions.clear()
+    hydratedContentTotalBytes = 0
+  }
   contentRangeCache.clear()
 }
 
@@ -693,6 +757,7 @@ function updateSizeAdjustmentPolicy(
 }
 
 const messageKeys = computed(() => props.messages.map(chatMessageKey))
+const restoredSizes = computed(() => new Map(props.restoredViewport?.rows.map(row => [row.key, row.size])))
 const hasTrailing = computed(() => Boolean(slots.trailing))
 const virtualizationEnabled = computed(() => (
   virtualizationAllowed.value && !props.shareMode && !props.virtualizationDisabled
@@ -706,6 +771,7 @@ const forcedIndexes = computed(() => {
       ensuredMessageKeys.value.has(key) || focusedMessageKey.value === key
       || layoutAnchorKey.value === key
       || props.forceMountMessageKeys?.has(key)
+      || (props.previewReadOnly && props.restoredViewport?.anchor?.key === key)
       || message.isStreaming || message.maintenance?.state === 'running'
       || message.parts?.some(part => part.type === 'interrupt' && !part.resolution)
     ) forced.add(index)
@@ -728,8 +794,14 @@ const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => {
     getScrollElement: () => props.scrollContainer ?? null,
     getItemKey: (index: number) => index < keys.length
       ? keys[index] : 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''),
-    estimateSize: (index: number) => index < props.messages.length
-      ? estimatedMessageSize(props.messages[index]) : 0,
+    estimateSize: (index: number) => {
+      const key = index < keys.length ? keys[index] : 'trailing:' + (props.trailingKey ?? props.sessionKey ?? '')
+      const cached = props.restoredViewport
+      // Width changes reflow text; never reuse an old-width height estimate.
+      const size = cached && Math.abs(cached.width - (props.scrollContainer?.clientWidth || layoutWidth)) < 1
+        ? restoredSizes.value.get(key) : undefined
+      return size ?? (index < props.messages.length ? estimatedMessageSize(props.messages[index]) : 0)
+    },
     overscan: 5,
     scrollMargin: scrollMargin.value,
     paddingEnd: props.bottomPadding ?? 0,
@@ -846,7 +918,8 @@ const variableLayout = computed(() => {
 })
 const renderEntries = computed(() => variableLayout.value.entries)
 
-watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, ...renderEntries.value.map(({ index }) => {
+watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, props.contentCacheScope,
+  props.contentCacheGeneration, ...renderEntries.value.map(({ index }) => {
   const message = props.messages[index]
   return message ? [contentHydrationKey(message, index), message.previewComplete, canHydrateContent(message)] : null
 })], () => {
@@ -859,6 +932,7 @@ watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, ...renderEntr
     // remain pending after abort, while the same row is already mounted again.
     // The old finally block checks controller identity before touching a new read.
     hydrationControllers.delete(previousOwner.key)
+    hydrationPromises.delete(previousOwner.key)
     hydrationLoading.delete(previousOwner.key)
   }
   // An evicted successful body can be restored when its row is mounted again.
@@ -908,6 +982,38 @@ async function ensureMessageVisible(index: number): Promise<HTMLElement | null> 
   return messageElement(messageKeys.value.indexOf(key))
 }
 
+async function ensureMessageContentVisible(index: number): Promise<HTMLElement | null> {
+  const message = props.messages[index]
+  if (!message) return null
+  const key = messageKeys.value[index]
+  const contentKey = contentHydrationKey(message, index)
+  const generation = contentHydrationGeneration
+  const session = props.sessionKey
+  const epoch = props.scrollEpoch
+  const element = await ensureMessageVisible(index)
+  if (!element || generation !== contentHydrationGeneration) return null
+  const pending = hydrateContent(message, index)
+  const signal = hydrationControllers.get(contentKey)?.signal
+  if (signal) {
+    // Shared range transports can outlive a cancelled waiter. Find navigation
+    // must release its old session without waiting for that transport to finish.
+    await new Promise<void>(resolve => {
+      const finish = () => { signal.removeEventListener('abort', finish); resolve() }
+      if (signal.aborted) finish()
+      else {
+        signal.addEventListener('abort', finish, { once: true })
+        void pending.then(finish, finish)
+      }
+    })
+  } else await pending
+  await nextTick()
+  if (signal?.aborted || generation !== contentHydrationGeneration
+    || session !== props.sessionKey || epoch !== props.scrollEpoch) return null
+  const currentIndex = messageKeys.value.indexOf(key)
+  if (currentIndex < 0 || contentHydrationKey(props.messages[currentIndex], currentIndex) !== contentKey) return null
+  return messageElement(currentIndex)
+}
+
 function releaseEnsuredMessage(index?: number) {
   const next = new Set(ensuredMessageKeys.value)
   if (index === undefined) next.clear()
@@ -932,6 +1038,37 @@ function scrollToEnd(options?: Pick<ScrollToOptions, 'behavior'>) {
   liveEdgeSeek = true
   cancelledSeek = false
   virtualizer.value.scrollToEnd(options)
+}
+
+function captureViewport(): ChatViewportSnapshot {
+  const container = props.scrollContainer
+  const top = container?.scrollTop ?? 0
+  const item = virtualizer.value.getVirtualItemForOffset(top)
+  return {
+    scrollTop: top,
+    width: container?.clientWidth || layoutWidth,
+    followLiveEdge: props.followLiveEdge === true,
+    anchor: item ? { key: String(item.key), intraOffset: top - item.start } : null,
+    rows: virtualizer.value.getVirtualItems().slice(-201).map(row => ({ key: String(row.key), size: row.size })),
+  }
+}
+
+function restoreViewport(snapshot: ChatViewportSnapshot) {
+  // Restoring a session is a new explicit position owner. Retire any pending
+  // layout correction for the previously displayed session/reading position.
+  cancelScroll()
+  if (snapshot.followLiveEdge) { scrollToEnd({ behavior: 'auto' }); return }
+  const anchor = virtualizer.value.getVirtualItems().find(item => item.key === snapshot.anchor?.key)
+  const offset = anchor && snapshot.anchor ? anchor.start + snapshot.anchor.intraOffset : snapshot.scrollTop
+  cancelledSeek = false
+  liveEdgeSeek = false
+  virtualizer.value.scrollToOffset(Math.max(0, offset), { behavior: 'auto' })
+  // ResizeObserver can run before the browser delivers this scroll event.
+  // Publish the actual (possibly clamped) offset now, so row-height adjustments
+  // cannot overwrite the restored position using the previous session's offset.
+  synchronizeScrollOffset?.()
+  rememberReadingAnchor()
+  captureReadingText()
 }
 
 function cancelScroll() {
@@ -1150,6 +1287,8 @@ function syncPreference(event: StorageEvent) {
 
 defineExpose<ChatMessageListVirtualizer>({
   ensureMessageVisible,
+  ensureMessageContentVisible,
+  messageBodyText: index => props.messages[index] ? hydratedMessage(props.messages[index], index).text : '',
   releaseEnsuredMessage,
   messageIndexAtOffset: offset => {
     const index = virtualizer.value.getVirtualItemForOffset(offset)?.index
@@ -1165,15 +1304,25 @@ defineExpose<ChatMessageListVirtualizer>({
   geometryVersion: () => measurementVersion.value,
   remeasure,
   isVirtualized: () => virtualizationEnabled.value,
+  captureViewport,
+  restoreViewport,
 })
 
-watch([() => props.sessionKey, () => props.scrollEpoch], (current, previous) => {
-  if (current[0] !== previous[0] || current[1] !== previous[1]) resetContentHydrationState()
+watch([
+  () => props.sessionKey, () => props.scrollEpoch,
+  () => props.contentCacheScope, () => props.contentCacheGeneration,
+], (current, previous) => {
+  const reusableScope = Boolean(current[2]) && current[2] === previous[2] && current[3] === previous[3]
+  const sameSessionReset = current[0] === previous[0] && current[1] !== previous[1]
+  resetContentHydrationState(reusableScope, sameSessionReset ? current[0] : undefined)
   cancelScroll()
   ensuredMessageKeys.value = new Set()
   focusedMessageKey.value = null
   virtualizer.value.measure()
-}, { flush: 'sync' })
+// Batch the session and scroll-epoch prop changes from one parent render. A
+// synchronous per-prop watcher can otherwise mistake the second assignment
+// for a reset of the newly restored session and discard its cached bodies.
+}, { flush: 'pre' })
 watch(messageKeys, keys => {
   const retained = new Set(keys)
   ensuredMessageKeys.value = new Set([...ensuredMessageKeys.value].filter(key => retained.has(key)))
@@ -1295,6 +1444,10 @@ function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapsh
 </script>
 
 <style scoped>
+.chat-message-list__row--find {
+  outline: 1px solid var(--accent);
+  outline-offset: 4px;
+}
 .chat-message-list {
   display: flex;
   flex: 0 0 auto;

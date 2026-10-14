@@ -60,6 +60,7 @@ from opensquilla.gateway.terminal_activity import (
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
 )
+from opensquilla.provider.failures import safe_http_status
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -606,6 +607,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
 
     metadata = dict(envelope.metadata)
     metadata.pop("selected_skills", None)
+    metadata.pop("office_candidate", None)
     authority = metadata.get("activation_authority")
     if isinstance(authority, Mapping) and authority.get("authority_kind") == "goal_lease":
         # The route can outlive its Goal turn. Preserve its authenticated
@@ -3769,6 +3771,37 @@ class TaskRuntime:
         source: str | None,
         reason: str | None,
     ) -> int:
+        """Finish an accepted cancellation even when its observer times out.
+
+        Freeze the task objects before handing ownership to the child. A Stop
+        response deadline must not interrupt persistence before the matching
+        coroutine is signalled, nor let delayed cleanup select a successor.
+        """
+
+        loop = asyncio.get_running_loop()
+        cancellation = self._cancel_runtime_tasks_impl(
+            tuple(candidates), source=source, reason=reason,
+        )
+        operation: asyncio.Task[int]
+        if loop.get_task_factory() is None:
+            # Preserve same-tick cancellation of an activated driver that has
+            # not entered _execute yet, as terminal settlement already does.
+            operation = asyncio.Task(cancellation, loop=loop, eager_start=True)
+        else:
+            operation = loop.create_task(cancellation)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await self._wait_for_task_settlement(operation)
+            raise
+
+    async def _cancel_runtime_tasks_impl(
+        self,
+        candidates: Sequence[_RuntimeTask],
+        *,
+        source: str | None,
+        reason: str | None,
+    ) -> int:
         """Atomically close cancellation and same-turn acceptance for a batch."""
 
         queued_tasks: list[_RuntimeTask] = []
@@ -4518,6 +4551,10 @@ class TaskRuntime:
             session_key=canonicalize_session_key(envelope.session_key),
         )
         _validate_route_session_owner(envelope)
+        # One Office selection owns one candidate transaction. Merging another
+        # input would lose either its pinned identity or the original candidate.
+        if envelope.metadata.get("office_candidate") is not None:
+            return None
         async with self._state_lock:
             pending = self._pending_by_session.get(envelope.session_key, [])
             candidate = next(
@@ -4542,6 +4579,8 @@ class TaskRuntime:
                     or candidate.queue_mode != "collect"
                     or candidate.status != AgentTaskStatus.QUEUED
                 ):
+                    return None
+                if candidate.envelope.metadata.get("office_candidate") is not None:
                     return None
                 candidate_session_id = getattr(candidate.envelope, "session_id", None)
                 incoming_session_id = getattr(envelope, "session_id", None)
@@ -5014,6 +5053,7 @@ class TaskRuntime:
                 return
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
             failure_kind = str(getattr(exc, "failure_kind", None) or "") or None
+            http_status = safe_http_status(getattr(exc, "http_status", None))
             status = (
                 AgentTaskStatus.TIMEOUT if terminal_reason == "timeout" else AgentTaskStatus.FAILED
             )
@@ -5025,6 +5065,7 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                http_status=http_status,
                 error_id=safe_error_id(getattr(exc, "error_id", None)),
                 retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
                 activity_snapshot=getattr(exc, "activity_snapshot", None),
@@ -5568,6 +5609,8 @@ class TaskRuntime:
         details = target_task.details if isinstance(target_task.details, dict) else {}
         metadata_raw = details.get("metadata")
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+        # Promoted steering is a new turn, not recovery of the original Office edit.
+        metadata.pop("office_candidate", None)
         recovery_target_turn_id = str(
             metadata.get("promoted_from_turn_id")
             or metadata.get("target_turn_id")
@@ -6930,6 +6973,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        http_status: int | None = None,
         error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
@@ -6957,6 +7001,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                         error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
@@ -7030,6 +7075,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        http_status: int | None = None,
         error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
@@ -7160,6 +7206,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    http_status=http_status,
                     error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
@@ -7246,9 +7293,12 @@ class TaskRuntime:
                         code=terminal_reason if terminal_reason != "error" else error_class,
                         error_class=error_class,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                     ).to_dict()
                     if safe_error_id(error_id):
                         turn_outcome["error_id"] = error_id
+                if safe_http_status(http_status) is not None:
+                    payload["http_status"] = http_status
                 payload["code"] = error_class or terminal_reason
                 payload["turn_outcome"] = {
                     **turn_outcome,
@@ -7284,6 +7334,7 @@ class TaskRuntime:
                         message=error_message,
                         error_class=error_class,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                     ).to_dict()
                     if retry_after_ms is not None:
                         turn_outcome["retry_after_ms"] = retry_after_ms
@@ -7328,6 +7379,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        http_status=http_status,
                         error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
@@ -7791,6 +7843,7 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        http_status: int | None = None,
         retry_after_ms: int | None,
         activity_snapshot: object,
         terminal_at: int,
@@ -7931,6 +7984,7 @@ class TaskRuntime:
                 message=error_message,
                 error_class=error_class,
                 failure_kind=failure_kind,
+                http_status=http_status,
             ).to_dict()
             if safe_error_id(error_id):
                 turn_outcome["error_id"] = error_id
@@ -8011,6 +8065,7 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        http_status: int | None = None,
         retry_after_ms: int | None,
         activity_snapshot: object,
         usage_call_index: int | None,
@@ -8036,6 +8091,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    http_status=http_status,
                     error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=preserved_activity_snapshot,

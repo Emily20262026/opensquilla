@@ -80,7 +80,7 @@ export interface ArtifactDocumentProvider {
 export interface WorkbenchResourceProvider {
   available(): boolean
   canImportDocuments(): boolean
-  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal }): Promise<WorkbenchResourcesListResponse>
+  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal; singlePage?: boolean }): Promise<WorkbenchResourcesListResponse>
   get(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchResource | null>
   open?(sessionKey: string, resource: WorkbenchResourceRef, request: { intent: 'edit-current'; expectedSha256?: string; idempotencyKey: string }, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
   createPreview?(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchPreviewResponse | null>
@@ -94,6 +94,7 @@ export interface ArtifactDocumentChange {
 }
 
 export interface ArtifactCatalog {
+  get(sessionKey: string, artifactId: string, signal?: AbortSignal): Promise<ArtifactPayload | null>
   listSession(
     sessionKey: string,
     options?: { readonly limit?: number; readonly signal?: AbortSignal },
@@ -160,6 +161,12 @@ export interface AttachmentUploadReceipt {
   readonly ttlSeconds?: number
 }
 
+export interface AttachmentTextPreview {
+  readonly content: string
+  readonly truncated: boolean
+  readonly totalBytes: number
+}
+
 /** Authenticated artifact and attachment bytes without endpoint or header leakage. */
 export interface WorkingFileRequest {
   sessionKey: string
@@ -180,7 +187,26 @@ export interface WorkingFileMetadata {
   size: number
 }
 
+export type HtmlBundleExportTarget =
+  | { readonly type: 'artifact'; readonly artifactId: string }
+  | { readonly type: 'document'; readonly documentId: string; readonly revisionId: string }
+  | { readonly type: 'working'; readonly documentId: string; readonly pagePath?: string }
+
+export interface HtmlBundleExportRequest {
+  readonly target: HtmlBundleExportTarget
+  readonly sessionKey: string
+  readonly signal?: AbortSignal
+}
+
+export class HtmlBundleExportError extends Error {
+  readonly name = 'HtmlBundleExportError'
+  constructor(readonly code: 'unavailable' | 'incomplete' | 'too-large' | 'source-forbidden' | 'source-changed' | 'failed') {
+    super(`HTML bundle export ${code}`)
+  }
+}
+
 export interface ArtifactContentAccess {
+  exportHtmlBundle?(request: HtmlBundleExportRequest): Promise<{ blob: Blob; filename: string }>
   workingFileMetadata?(request: WorkingFileRequest): Promise<WorkingFileMetadata | null>
   fetchWorkingFile?(request: WorkingFileRequest): Promise<Blob>
   fetchArtifact(
@@ -200,6 +226,15 @@ export interface ArtifactContentAccess {
     attachment: DisplayAttachment,
     request?: ArtifactAccessRequest,
   ): Promise<AttachmentFetchResult>
+  /** Bounded text projection; never substitutes for a complete attachment download. */
+  readAttachmentPreview?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<AttachmentTextPreview>
+  downloadAttachment?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<'saved' | 'cancelled'>
   uploadAttachment(file: File, mime: string): Promise<AttachmentUploadReceipt>
 }
 
@@ -267,6 +302,8 @@ export interface NativeHtmlArtifactResource {
 
 export interface ArtifactPreviewResourceOptions {
   artifact: () => ArtifactPayload
+  /** Resolve only registered images in the current session, never arbitrary file paths. */
+  resolveMarkdownImage?: (source: string, signal: AbortSignal) => Promise<ArtifactPayload | null>
   createObjectUrl?: (blob: Blob) => string
   htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
   htmlLaunchUrl?: () => string
@@ -281,7 +318,10 @@ export interface ArtifactPreviewResourceController {
   errorCode: Ref<ArtifactPreviewResourceErrorCode | null>
   kind: Ref<ArtifactWorkbenchPreviewKind>
   markdownHtml: ShallowRef<string>
+  /** Ready image resources are patched into stable Markdown placeholders. */
+  markdownImages?: ShallowRef<ReadonlyMap<string, string>>
   objectUrl: ShallowRef<string>
+  binary?: ShallowRef<ArrayBuffer | null>
   progress: Ref<number | null>
   relativeResources: ShallowRef<string[]>
   state: Ref<ArtifactPreviewResourceState>

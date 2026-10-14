@@ -46,6 +46,8 @@ validate_partition_payload = SHARD_MODULE["validate_partition_payload"]
 
 OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Cancellation settlement uses the provisional floor until a Windows refresh.
+    "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
     # Generator provenance checks use the provisional floor pending Windows samples.
     "tests/contracts/test_codegen_versions.py",
     # Security inventory, rendering, and functional probes use measured Windows
@@ -941,6 +943,7 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
     expected = {
         "tests/test_ci/test_router_artifact_manifest.py": "core",
         "tests/test_channels/test_feishu_sdk_websocket.py": "gateway-sqlite",
+        "tests/test_gateway/test_task_runtime_cancellation_settlement.py": "gateway-sqlite",
         "tests/test_gateway/test_task_runtime_terminal_cleanup.py": "gateway-sqlite",
         "tests/test_persistence/test_migrator.py": "gateway-sqlite",
         "tests/test_session/test_manager.py": "gateway-sqlite",

@@ -42,8 +42,7 @@
           :step-count="activityStepCount"
           :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
-          :summary-label="displayActivitySummaryLabel"
-          :detail-label="displayActivityDetailLabel"
+          :summary-label="activitySummaryLabel"
           :phase-label="hasPlan ? t('chat.plan.process') : ''"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
@@ -52,20 +51,19 @@
           @open-change="activityDetailsOpen = $event"
         >
           <UnifiedAssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="hasUnifiedActivityOrder"
             :projection="visibleActivityProjection"
             :timeline-items="visibleActivityItems"
             :reasoning-blocks="reasoningBlocks"
-            :reasoning-pace-bursts="reasoningRevealPending"
             :state-scope="toolStateScope"
             :is-tool-group-open="isToolGroupOpen"
             :is-tool-item-open="isToolItemOpen"
             :tool-group-status-text="toolGroupStatusText"
             :tool-status-text="toolStatusText"
             :tool-secondary-text="toolSecondaryText"
-            @reveal-complete="completeTerminalReasoningReveal"
-            @toggle-group="$emit('toggleToolGroup', $event)"
-            @toggle-item="$emit('toggleToolItem', $event)"
+            @toggle-group="(id, open) => $emit('toggleToolGroup', id, open)"
+            @toggle-item="(id, open) => $emit('toggleToolItem', id, open)"
             @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           >
             <template #interrupt="{ part }">
@@ -82,6 +80,7 @@
           </UnifiedAssistantActivityTimeline>
           <template v-else>
           <AssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="hasBeforeReasoningActivity"
             :projection="visibleActivityProjection"
             status-position="before-reasoning"
@@ -95,22 +94,23 @@
           />
           <ReasoningTimeline
             v-if="reasoningBlocks.length"
+            :session-key="sessionKey"
             :blocks="reasoningBlocks"
-            :pace-bursts="reasoningRevealPending"
             nested
             timeline-phase
-            @reveal-complete="completeTerminalReasoningReveal"
           />
           <ReasoningPart
             v-else-if="reasoningPart"
             :part="reasoningPart"
             :live="activityLifecycle === 'working' || activityLifecycle === 'answering'"
+            :motion-active="false"
             :embedded="hasPlan"
             :hide-summary="hasPlan"
             :nested="!hasPlan"
             :timeline-phase="!hasPlan"
           />
           <AssistantActivityTimeline
+            :session-key="sessionKey"
             v-if="
               visibleActivityItems.length
               || hasAfterReasoningActivity
@@ -124,8 +124,8 @@
             :tool-group-status-text="toolGroupStatusText"
             :tool-status-text="toolStatusText"
             :tool-secondary-text="toolSecondaryText"
-            @toggle-group="$emit('toggleToolGroup', $event)"
-            @toggle-item="$emit('toggleToolItem', $event)"
+            @toggle-group="(id, open) => $emit('toggleToolGroup', id, open)"
+            @toggle-item="(id, open) => $emit('toggleToolItem', id, open)"
             @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
           >
             <template #interrupt="{ part }">
@@ -173,13 +173,14 @@
       <template v-else>
         <ReasoningTimeline
           v-if="reasoningBlocks.length"
+          :session-key="sessionKey"
           :blocks="reasoningBlocks"
-          :pace-bursts="reasoningRevealPending"
-          @reveal-complete="completeTerminalReasoningReveal"
           @open-change="legacyReasoningOpen = $event"
         />
         <ReasoningPart v-else-if="reasoningPart" :part="reasoningPart" @open-change="legacyReasoningOpen = $event" />
         <ToolCallTimeline
+          :session-key="sessionKey"
+          presentation="activity"
           :items="visibleLegacyTimelineItems"
           :state-scope="toolStateScope"
           :is-tool-group-open="isToolGroupOpen"
@@ -187,8 +188,8 @@
           :tool-group-status-text="toolGroupStatusText"
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
-          @toggle-group="$emit('toggleToolGroup', $event)"
-          @toggle-item="$emit('toggleToolItem', $event)"
+          @toggle-group="(id, open) => $emit('toggleToolGroup', id, open)"
+          @toggle-item="(id, open) => $emit('toggleToolItem', id, open)"
           @open-change="legacyToolsOpen = $event"
           @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
         >
@@ -543,6 +544,7 @@ import type {
   PlanPresentationRequest,
 } from '@/types/plans'
 import {
+  canMergeAssistantActivityOrder,
   isBeforeReasoningActivityStatusStep,
   isRoutineActivityPhaseStep,
   isVisibleActivityStatusStep,
@@ -550,6 +552,7 @@ import {
   type AssistantActivityLifecycle,
 } from '@/utils/chat/assistantActivity'
 import {
+  assistantActivityContinuityKey,
   readAssistantActivityDuration,
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
@@ -571,8 +574,8 @@ const props = defineProps<{
   renderMarkdown: (text: string) => string
   fmtTok: (value: number) => string
   toolCallGroups: (calls: ChatToolCall[], baseKey: string) => ChatToolCallGroup[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
@@ -605,8 +608,8 @@ const emit = defineEmits<{
   toggleShare: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
-  toggleToolGroup: [groupId: string]
-  toggleToolItem: [renderKey: string]
+  toggleToolGroup: [groupId: string, open: boolean]
+  toggleToolItem: [renderKey: string, open: boolean]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
   fork: []
   resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
@@ -672,18 +675,6 @@ const reasoningBlocks = computed(() =>
     .filter(block => block.text)
     .map(block => ({ ...block })),
 )
-const reasoningRevealPending = ref(Boolean(
-  props.message.reasoningPresentationPending
-  && !(
-    typeof window !== 'undefined'
-    && typeof window.matchMedia === 'function'
-    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  ),
-))
-
-function completeTerminalReasoningReveal() {
-  reasoningRevealPending.value = false
-}
 // Inline interrupt parts (approval / clarify) fold into the body order after
 // text/tools and before the ending; render them through the shared adapter.
 const interruptParts = computed(
@@ -867,7 +858,7 @@ const toolMessageIdentity = computed(() => (
 
 const toolStateScope = computed(() => JSON.stringify([
   props.sessionKey || '',
-  toolMessageIdentity.value,
+  props.message.turnKey || toolMessageIdentity.value,
 ]))
 
 const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
@@ -946,7 +937,12 @@ const activityProjection = computed(() =>
 function withoutFailedActivity(items: ChatStreamTimelineItem[]): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const groupFailure = (item.group.isError || item.group.status === 'error')
+    // A restored aggregate failure identifies the member only when the
+    // original group contains one settled call. Keep ambiguous batch failures
+    // on the group instead of changing successful members into failures.
+    const groupFailure = item.group.calls.length === 1 && !item.group.isRunning
+      && !item.group.calls[0]?.isRunning
+      && (item.group.isError || item.group.status === 'error')
       && !item.group.calls.some(call => call.isError || call.status === 'error')
     const calls = item.group.calls
       .filter(call => !createdSessionCallIds.value.has(call.toolId))
@@ -982,20 +978,11 @@ const visibleActivityProjection = computed(() => ({
   activityClusters: visibleActivityClusters.value,
   statusSteps: visibleActivityStatusSteps.value,
 }))
-function validActivityOrder(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
-}
-const hasUnifiedActivityOrder = computed(() => {
-  const orders = [
-    ...visibleActivityStatusSteps.value.map(step => step.activityOrder),
-    ...reasoningBlocks.value.map(block => block.activityOrder),
-    ...visibleActivityItems.value.map(item => (
-      item.activityOrder
-      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
-    )),
-  ]
-  return orders.length > 0 && orders.every(validActivityOrder)
-})
+const hasUnifiedActivityOrder = computed(() => canMergeAssistantActivityOrder(
+  visibleActivityStatusSteps.value,
+  reasoningBlocks.value,
+  visibleActivityItems.value,
+))
 const hasBeforeReasoningActivity = computed(() =>
   visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
 )
@@ -1063,11 +1050,9 @@ const activityStepCount = computed(() => Math.max(
 const activityDefaultOpen = computed(() =>
   activityLifecycle.value === 'working'
   || activityLifecycle.value === 'answering'
-  || reasoningRevealPending.value,
 )
 const activityCompletionConfirmed = computed(() =>
   activityLifecycle.value === 'settled'
-  && !reasoningRevealPending.value
   && !props.message.isStreaming
   && interruptParts.value.every(part =>
     !part.busy
@@ -1083,15 +1068,9 @@ const activityStateKey = computed(() => JSON.stringify([
   activityTurnIdentity.value,
   toolMessageIdentity.value,
 ]))
-const activityContinuityKey = computed(() =>
-  props.message.turnKey
-    ? JSON.stringify([
-        props.sessionKey || '',
-        'assistant-activity-turn',
-        props.message.turnKey,
-      ])
-    : '',
-)
+const activityContinuityKey = computed(() => assistantActivityContinuityKey(
+  props.sessionKey || '', props.message.turnKey || '',
+))
 
 // Finished phase rows and the total must use one timing model. Routine status
 // steps are consecutive slices of the client-observed turn, so their sum is a
@@ -1239,24 +1218,12 @@ const activitySummaryLabel = computed(() => {
     ].filter(Boolean).join(' · '))
   }
   if (activityCompletionConfirmed.value) {
-    return withMaintenanceSummary([
-        String(t('chat.activity.lifecycle.settled')),
-        activityCompactElapsedLabel.value,
-      ].filter(Boolean).join(' · '))
+    return activityCompactElapsedLabel.value
+      ? String(t('chat.activityElapsed', { duration: activityCompactElapsedLabel.value }))
+      : String(t('chat.activity.lifecycle.settled'))
   }
   return withMaintenanceSummary(activityDetailLabel.value)
 })
-const planActivitySummaryLabel = computed(() => [
-  String(t('chat.plan.process')),
-  activityCompactElapsedLabel.value,
-].filter(Boolean).join(' · '))
-const displayActivitySummaryLabel = computed(() =>
-  hasPlan.value ? planActivitySummaryLabel.value : activitySummaryLabel.value,
-)
-const displayActivityDetailLabel = computed(() =>
-  hasPlan.value ? '' : activityDetailLabel.value,
-)
-
 function onMessageClick(event: MouseEvent) {
   if (!props.shareMode) return
   if (props.message.stopNotice) return
@@ -1276,7 +1243,7 @@ function fmtUsd(value: number): string {
 <style scoped>
 .assistant-activity-incomplete {
   margin: 0.375rem 0 0;
-  color: color-mix(in srgb, var(--text) 52%, transparent);
+  color: var(--text-muted);
   font-size: 0.75rem;
 }
 
@@ -1371,8 +1338,8 @@ function fmtUsd(value: number): string {
 
 .assistant-answer--separated {
   margin-top: 0;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--hairline);
+  padding-top: 0.5rem;
+  border-top: 0;
 }
 
 .plan-message-card {

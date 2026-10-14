@@ -1017,6 +1017,10 @@ _CREATE_IDX_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_transcript_session_cursor
 ON transcript_entries(session_id, created_at, id)
 """
+_CREATE_IDX_TRANSCRIPT_MESSAGE = """
+CREATE INDEX IF NOT EXISTS idx_transcript_session_message
+ON transcript_entries(session_id, message_id, created_at, id)
+"""
 _CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES = """
 CREATE INDEX IF NOT EXISTS idx_transcript_title_candidates
 ON transcript_entries(session_id, role, content_byte_length, created_at, id)
@@ -1066,6 +1070,10 @@ ON compacted_transcript_entries(session_key)
 _CREATE_IDX_COMPACTED_TRANSCRIPT_CURSOR = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_cursor
 ON compacted_transcript_entries(session_id, created_at, original_entry_id, id)
+"""
+_CREATE_IDX_COMPACTED_TRANSCRIPT_MESSAGE = """
+CREATE INDEX IF NOT EXISTS idx_compacted_transcript_session_message
+ON compacted_transcript_entries(session_id, message_id, created_at, original_entry_id, id)
 """
 _CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES = """
 CREATE INDEX IF NOT EXISTS idx_compacted_transcript_title_candidates
@@ -2735,10 +2743,12 @@ class SessionStorage:
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_KEY)
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_CURSOR)
+        await self._conn.execute(_CREATE_IDX_TRANSCRIPT_MESSAGE)
         await self._conn.execute(_CREATE_COMPACTED_TRANSCRIPT)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_SESSION)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_KEY)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_CURSOR)
+        await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_MESSAGE)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_COMPACTION)
         await self._conn.execute(_CREATE_SUMMARIES)
         await self._conn.execute(_CREATE_IDX_SUMMARIES)
@@ -15054,6 +15064,69 @@ class SessionStorage:
             return None
         return TranscriptEntry(**_deserialize_row(dict(row)))
 
+    async def get_canonical_transcript_replay(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        max_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Read one bounded replay envelope for an explicitly opened detail.
+
+        Byte admission happens in SQLite before the text crosses into Python.
+        Each indexed source contributes at most one candidate; a newer missing
+        or oversized replay does not fall back to an older version. Normal
+        history projections never need this potentially large internal data.
+        """
+        if max_bytes <= 0:
+            return None
+        sql = """
+            WITH active AS (
+                SELECT id, created_at,
+                    CASE WHEN length(CAST(assistant_replay AS BLOB)) <= ?
+                         THEN assistant_replay ELSE NULL END AS assistant_replay
+                FROM transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            ), archived AS (
+                SELECT original_entry_id AS id, created_at,
+                    CASE WHEN length(CAST(assistant_replay AS BLOB)) <= ?
+                         THEN assistant_replay ELSE NULL END AS assistant_replay
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND message_id = ?
+                ORDER BY created_at DESC, original_entry_id DESC,
+                    compacted_transcript_entries.id DESC
+                LIMIT 1
+            ), candidates AS (
+                SELECT * FROM active
+                UNION ALL
+                SELECT * FROM archived
+            )
+            SELECT assistant_replay FROM candidates
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """
+        rows = await self._read_history_query(
+            sql, (max_bytes, session_id, message_id, max_bytes, session_id, message_id),
+        )
+        if not rows or not isinstance(rows[0]["assistant_replay"], str):
+            return None
+        raw = rows[0]["assistant_replay"]
+        budget = current_read_budget()
+        try:
+            if budget is None:
+                decoded = await asyncio.to_thread(json.loads, raw)
+            else:
+                budget.check()
+                task = asyncio.create_task(asyncio.to_thread(json.loads, raw))
+                self._pending_reader_operations.add(task)
+                task.add_done_callback(self._pending_reader_operations.discard)
+                decoded = await budget.wait_for(task)
+        except (json.JSONDecodeError, RecursionError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
     @_serialized_read
     async def list_stranded_steer_inputs(self) -> list[StrandedSteerInput]:
         """Return pending steer rows whose exact target task can no longer run.
@@ -17316,6 +17389,177 @@ class SessionStorage:
             ) as cur:
                 changed = cur.rowcount or 0
         return int(changed)
+
+    @_serialized_read
+    async def read_message_search_coverage_identity(self, session_id: str) -> dict[str, Any]:
+        """Capture archive proof boundaries without counting the archive.
+
+        The session indexes include SQLite's rowid, so each newest-ID lookup
+        seeks to one row. Search checks the same identity after incremental
+        verification instead of holding a WAL snapshot across requests.
+        """
+        async with self.conn.execute("""
+            SELECT compaction_count, forked_from_parent, schema_version,
+                COALESCE((SELECT id FROM session_summaries
+                    WHERE session_id = sessions.session_id ORDER BY id DESC LIMIT 1), 0)
+                    AS summary_upper,
+                COALESCE((SELECT id FROM compacted_transcript_entries
+                    WHERE session_id = sessions.session_id ORDER BY id DESC LIMIT 1), 0)
+                    AS archive_upper
+            FROM sessions WHERE session_id = ?
+        """, (session_id,)) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else {}
+
+    @_serialized_read
+    async def read_message_search_coverage_summaries(
+        self, session_id: str, *, after: int, through: int, limit: int,
+    ) -> list[dict[str, Any]]:
+        async with self.conn.execute("""
+            SELECT id, compaction_id, removed_count, covered_through_id
+            FROM session_summaries
+            WHERE session_id = ? AND id > ? AND id <= ? ORDER BY id LIMIT ?
+        """, (session_id, after, through, max(1, min(limit, 256)))) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    @_serialized_read
+    async def read_message_search_coverage_archives(
+        self, session_id: str, *, after: int, through: int, limit: int,
+        compaction_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clause = " AND compaction_id = ?" if compaction_id is not None else ""
+        params: list[Any] = [session_id, after, through]
+        if compaction_id is not None:
+            params.append(compaction_id)
+        params.append(max(1, min(limit, 256)))
+        # Prefer the compaction prefix explicitly. On a newly opened database
+        # without planner statistics SQLite may otherwise scan every earlier
+        # archive for this session before finding the requested compaction.
+        index = ("idx_compacted_transcript_session_compaction" if compaction_id is not None
+                 else "idx_compacted_transcript_session_id")
+        async with self.conn.execute(
+            f"SELECT id, original_entry_id FROM compacted_transcript_entries INDEXED BY {index} "
+            "WHERE session_id = ? AND id > ? AND id <= ?" + clause + " ORDER BY id LIMIT ?",
+            params,
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    @_serialized_read
+    async def read_message_search_rows(
+        self, session_id: str, *, after: tuple[int, int] | None = None,
+        before: tuple[int, int] | None = None,
+        through: tuple[int, int] | None = None, limit: int = 65,
+        descending: bool = False, message_id: str | None = None,
+        visible_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Read a small canonical identity page, never materializing message bodies.
+
+        The original entry ID survives compaction. Both sources and duplicate
+        exclusion share one statement/snapshot; a concurrent archive cannot
+        make a row appear in neither source or twice in this page.
+        """
+        limit = max(1, min(int(limit), 65))
+        direction = "DESC" if descending else "ASC"
+        queries: list[str] = []
+        params: list[Any] = []
+        for source, table, identity in (
+            ("active", "transcript_entries", "id"),
+            ("compacted", "compacted_transcript_entries", "original_entry_id"),
+        ):
+            clauses = ["entry.session_id = ?", f"entry.{identity} IS NOT NULL"]
+            params.append(session_id)
+            if visible_only:
+                clauses.append("entry.role IN ('user', 'assistant')")
+            if message_id is not None:
+                clauses.append("entry.message_id = ?")
+                params.append(message_id)
+            for cursor, comparison in ((after, ">"), (before, "<"), (through, "<=")):
+                if cursor is not None:
+                    clauses.append(f"(entry.created_at, entry.{identity}) {comparison} (?, ?)")
+                    params.extend(cursor)
+            if source == "compacted":
+                clauses.append("NOT EXISTS (SELECT 1 FROM transcript_entries AS active "
+                               "WHERE active.session_id = entry.session_id "
+                               "AND active.id = entry.original_entry_id)")
+            queries.append(
+                f"SELECT * FROM (SELECT '{source}' AS source, entry.{identity} AS entry_id, "
+                "entry.message_id, entry.created_at, entry.content_revision, "
+                "entry.content_byte_length, entry.role "
+                f"FROM {table} AS entry WHERE {' AND '.join(clauses)} "
+                f"ORDER BY entry.created_at {direction}, entry.{identity} {direction} LIMIT ?)"
+            )
+            params.append(limit)
+        sql = "SELECT * FROM (" + " UNION ALL ".join(queries) + ") "
+        sql += f"ORDER BY created_at {direction}, entry_id {direction} LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(sql, params) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    @_serialized_read
+    async def read_message_search_body(
+        self, session_id: str, row: Mapping[str, Any], *,
+        max_bytes: int = MAX_DISPLAY_CONTENT_BYTES,
+    ) -> TranscriptEntry:
+        """Read bounded prose with only the metadata needed for display cleanup.
+
+        JSON envelopes are projected inside SQLite, so a caption remains
+        searchable without copying inline attachment bytes. The revision and
+        canonical entry identity fence the metadata/body round trip.
+        """
+        from opensquilla.content_reader import ContentExportLimitError
+        from opensquilla.session.attachment_history import MAX_INLINE_ENVELOPE_BYTES
+
+        visible = (
+            f"CASE WHEN COALESCE(content_byte_length, length(CAST(content AS BLOB))) "
+            f"<= {MAX_INLINE_ENVELOPE_BYTES} THEN CASE WHEN json_valid(content) "
+            "THEN CASE WHEN json_type(content, '$.text') = 'text' "
+            f"THEN json_object('text', {USER_DISPLAY_TEXT_SQL}, "
+            "'artifacts', json_extract(content, '$.artifacts')) ELSE content END "
+            "ELSE content END ELSE content END"
+        )
+        # Only flattened legacy bodies need structured segments to decide
+        # whether '[Used tool: ...]' is protocol or quoted prose. Ordinary
+        # messages never copy tool arguments/results into this narrow read.
+        segments = "CASE WHEN instr(content, '[Used tool:') > 0 THEN tool_calls END"
+        display_bytes = (
+            f"COALESCE(length(CAST(({visible}) AS BLOB)), 0) "
+            f"+ COALESCE(length(CAST(({segments}) AS BLOB)), 0)"
+        )
+        queries = []
+        params: list[Any] = []
+        for table, identity in (("transcript_entries", "id"),
+                                ("compacted_transcript_entries", "original_entry_id")):
+            active_precedence = (
+                " AND NOT EXISTS (SELECT 1 FROM transcript_entries AS active "
+                "WHERE active.session_id = compacted_transcript_entries.session_id "
+                "AND active.id = compacted_transcript_entries.original_entry_id)"
+                if table == "compacted_transcript_entries" else ""
+            )
+            queries.append(
+                "SELECT role, message_id, session_key, created_at, content_revision, tool_call_id, "
+                f"{identity} AS id, ({display_bytes}) AS display_bytes, "
+                f"CASE WHEN ({display_bytes}) <= ? THEN ({visible}) END AS content, "
+                f"CASE WHEN ({display_bytes}) <= ? THEN ({segments}) END AS tool_calls, "
+                "CASE WHEN json_valid(turn_context) THEN "
+                "json_object('plan_run_id', json_extract(turn_context, '$.plan_run_id'), "
+                "'run_kind', json_extract(turn_context, '$.run_kind'), "
+                "'input_mode', json_extract(turn_context, '$.input_mode')) "
+                "END AS turn_context "
+                f"FROM {table} WHERE session_id = ? AND {identity} = ? AND created_at = ? "
+                f"AND message_id = ? AND content_revision = ?{active_precedence}"
+            )
+            params.extend((max_bytes, max_bytes, session_id, row['entry_id'], row['created_at'],
+                           row['message_id'], row['content_revision']))
+        async with self.conn.execute(" UNION ALL ".join(queries) + " LIMIT 1", params) as cursor:
+            result = await cursor.fetchone()
+        if result is None:
+            raise HistoryCursorInvalidatedError("search message changed or was removed")
+        if result['display_bytes'] > max_bytes:
+            raise ContentExportLimitError("search display body exceeds the display read limit")
+        values = dict(result)
+        values.pop('display_bytes')
+        values['session_id'] = session_id
+        return (await self._decode_read_rows([values]))[0]
 
     # ── FTS5 Search ──────────────────────────────────────────────────────
 

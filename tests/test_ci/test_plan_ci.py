@@ -461,15 +461,18 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
         "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
         "tests/test_recovery/test_recovery_cmd.py",
     ]
-    importing_consumer = "tests/test_gateway/test_p1a_exact_abort_contract.py"
+    importing_consumers = [
+        "tests/test_gateway/test_p1a_exact_abort_contract.py",
+        "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
+    ]
 
     plan = plan_changes(paths, repo=Path.cwd(), config=suite_config)
 
     assert plan["full_fallback"] is False
-    assert plan["python_targets"] == sorted([*paths, importing_consumer])
+    assert plan["python_targets"] == sorted([*paths, *importing_consumers])
     assert plan["python_matrix"] == {
         "ubuntu": [],
-        "windows": _windows_partitions_for(*paths, importing_consumer),
+        "windows": _windows_partitions_for(*paths, *importing_consumers),
     }
     assert plan["desktop_matrix"] == []
     assert set(plan["required_suites"]) == {
@@ -2244,10 +2247,31 @@ def test_readme_locale_inputs_cover_the_executed_node_contract(
         "opensquilla-webui/.node-version",
         "opensquilla-webui/package.json",
         "opensquilla-webui/scripts/check-readme-locales.mjs",
-        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue",
         "opensquilla-webui/src/i18n/index.ts",
     } <= inputs
     assert "scripts/check_readme_locale_parity.py" not in inputs
+    assert "opensquilla-webui/src/components/LanguageSwitcher.vue" not in inputs
+
+
+def test_readme_locale_digest_tracks_current_language_control(
+    tmp_path: Path, suite_config: dict[str, Any],
+) -> None:
+    relative = "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue"
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True)
+    source.write_text("const LOCALE_LABELS = { en: 'English' }\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, relative)
+
+    source.write_text("const LOCALE_LABELS = { en: 'Changed' }\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, relative)
+
+    assert "readme-locale" in first["required_suites"]
+    assert (
+        first["suite_execution_digests"]["readme-locale"]
+        != second["suite_execution_digests"]["readme-locale"]
+    )
+    assert first["plan_digest"] != second["plan_digest"]
 
 
 def test_release_packaging_inputs_cover_root_readmes(

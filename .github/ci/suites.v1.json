@@ -249,7 +249,7 @@
         "opensquilla-webui/.node-version",
         "opensquilla-webui/package.json",
         "opensquilla-webui/scripts/check-readme-locales.mjs",
-        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue",
         "opensquilla-webui/src/i18n/index.ts"
       ]
     },

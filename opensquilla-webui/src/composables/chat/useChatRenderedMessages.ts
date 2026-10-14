@@ -1,4 +1,5 @@
 import { skillLoadsFromSegments } from '@/types/skillLoads'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 import { computed, type Ref } from 'vue'
 import type {
   ChatEnsembleMeta,
@@ -653,15 +654,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         // keep real process tools in the Activity timeline.
         toolCalls: normalizedToolCalls.filter(call => !isPlanMessage || call.name !== 'submit_plan'),
         timelineItems: stripBackgroundProcessNoticeTimeline(
-          applyActivityOrdersToTimeline(
-            stripPlanControlToolItems(projectInterruptTimeline(
+          stripPlanControlToolItems(projectInterruptTimeline(
               normalizeMessageTimeline(msg, ownerKey),
               historicalInterrupts,
               terminalOwner,
               options.interruptState?.value,
             ), isPlanMessage),
-            msg.activitySnapshot,
-          ),
           msg.tool_calls ?? [],
           options.renderMarkdown,
         ),
@@ -671,9 +669,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         reasoning: msg.role === 'assistant' ? msg.reasoning : undefined,
         reasoningBlocks: msg.role === 'assistant'
           ? msg.reasoningBlocks?.map(block => ({ ...block }))
-          : undefined,
-        reasoningPresentationPending: msg.role === 'assistant'
-          ? msg.reasoningPresentationPending
           : undefined,
         activitySnapshot: msg.role === 'assistant' ? msg.activitySnapshot : undefined,
         activitySnapshotIncomplete: msg.role === 'assistant'
@@ -1375,7 +1370,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     if (explicitTimeline.length) {
       const calls = normalizeToolCalls(msg.tool_calls)
       return sanitizeAssistantTimelineItems(
-        timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts),
+        applyActivityOrdersToTimeline(
+          timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts),
+          msg.activitySnapshot,
+          msg.historyPayloadPreview?.textUtf16Lengths,
+        ),
         { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
       )
     }
@@ -1383,7 +1382,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const hasPersistedTimeline = rawSegments.some(seg => ['text', 'tool_use', 'tool_result'].includes(String(seg?.type || '')))
     if (!hasPersistedTimeline) return []
     return sanitizeAssistantTimelineItems(
-      timelineFromPersistedSegments(rawSegments, ownerKey),
+      applyActivityOrdersToTimeline(
+        timelineFromPersistedSegments(rawSegments, ownerKey),
+        msg.activitySnapshot,
+        msg.historyPayloadPreview?.textUtf16Lengths,
+      ),
       { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
     )
   }
@@ -1476,12 +1479,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           html: options.renderMarkdown(raw),
           rawText: raw,
           presentation,
+          activityOrder: seg.activityOrder,
         }] : []
       }
       if (seg?.type === 'tool-group') {
         const groupId = String(seg.groupId || seg.group_id || '')
         const group = groupId ? groupsById.get(groupId) : null
-        return group ? [{ type: 'tool-group', key: groupId, group }] : []
+        return group ? [{ type: 'tool-group', key: groupId, group, activityOrder: seg.activityOrder }] : []
       }
       if (seg?.type === 'interrupt') {
         const approvalId = String(seg.approvalId || seg.approval_id || '')
@@ -1492,6 +1496,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
               key: part.key || `${ownerKey}:interrupt:${approvalId}`,
               approvalId,
               part,
+              activityOrder: seg.activityOrder,
             }]
           : []
       }
@@ -1603,6 +1608,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         call.isError = toolResultIsError(segment)
         call.status = call.isError ? 'error' : 'success'
         call.result = resultStr
+        Object.assign(call, toolResultMetadata(segment))
         if (typeof segment.execution_log_handle === 'string') {
           call.executionLogHandle = segment.execution_log_handle
         }
@@ -1929,6 +1935,27 @@ export function routerPanelDataset(mode: RouterVisualMode): string {
   return mode === 'legacy_grid' ? 'legacy-grid' : 'real-candidates'
 }
 
+function toolResultMetadata(value: {
+  resultTruncated?: unknown
+  resultOriginalChars?: unknown
+  result_truncated?: unknown
+  result_original_chars?: unknown
+  file_snapshot?: unknown
+  fileSnapshot?: unknown
+}): Pick<ChatToolCall, 'resultTruncated' | 'resultOriginalChars' | 'fileSnapshot'> {
+  const resultTruncated = value.resultTruncated ?? value.result_truncated
+  const resultOriginalChars = value.resultOriginalChars ?? value.result_original_chars
+  const fileSnapshot = normalizeToolFileSnapshot(value.fileSnapshot ?? value.file_snapshot)
+  return {
+    ...(fileSnapshot ? { fileSnapshot } : {}),
+    ...(typeof resultTruncated === 'boolean' ? { resultTruncated } : {}),
+    ...(typeof resultOriginalChars === 'number'
+      && Number.isSafeInteger(resultOriginalChars) && resultOriginalChars >= 0
+      ? { resultOriginalChars }
+      : {}),
+  }
+}
+
 function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall[] {
   if (!raw || !Array.isArray(raw)) return []
   const merged: ChatToolCall[] = []
@@ -1963,6 +1990,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
         sources: undefined,
         isOpen: false,
         presentation,
+        activityOrder: typeof tc.activityOrder === 'number' ? tc.activityOrder : undefined,
       }
       byId.set(toolId, item)
       merged.push(item)
@@ -1979,6 +2007,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
       item.status = isError ? 'error' : 'success'
     }
     if (tc.sources !== undefined) item.sources = tc.sources
+    Object.assign(item, toolResultMetadata(tc))
     if (typeof tc.execution_log_handle === 'string') {
       item.executionLogHandle = tc.execution_log_handle
     }
@@ -2000,9 +2029,11 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     isError: item.isError,
     result: item.result,
     resultPreview: item.resultPreview,
+    ...toolResultMetadata(item),
     executionLogHandle: item.executionLogHandle,
     sources: item.sources,
     isOpen: false,
     presentation: item.presentation,
+    activityOrder: item.activityOrder,
   }))
 }

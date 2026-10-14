@@ -14,6 +14,20 @@ function row(index: number): SidebarDisplayRow {
   }
 }
 type Block = { key: string; rows: SidebarDisplayRow[]; collapsed: boolean }
+function recordResizeObservers() {
+  const observers: Array<{ callback: ResizeObserverCallback; elements: Set<Element> }> = []
+  vi.stubGlobal('ResizeObserver', class {
+    record: (typeof observers)[number]
+    constructor(callback: ResizeObserverCallback) {
+      this.record = { callback, elements: new Set() }
+      observers.push(this.record)
+    }
+    observe(element: Element) { this.record.elements.add(element) }
+    unobserve(element: Element) { this.record.elements.delete(element) }
+    disconnect() { this.record.elements.clear() }
+  })
+  return observers
+}
 async function flush() {
   await nextTick()
   await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
@@ -153,6 +167,101 @@ describe('sidebar TanStack window', () => {
     expect(state.api.renderedBlocks.value[0]!.gapAfter).toBe(0)
     expect(state.api.hasRow('task-100')).toBe(false)
     expect(state.api.hasRow('task-350')).toBe(true)
+  })
+
+  it('preserves the reading anchor on a drawer width change during backward scrolling', async () => {
+    const observers = recordResizeObservers()
+    const state = await mount()
+    state.element.scrollTop = 100 * 44
+    state.element.dispatchEvent(new Event('scroll'))
+    await flush()
+    state.element.scrollTop = 90 * 44 + 12
+    state.element.dispatchEvent(new Event('scroll'))
+    await flush()
+
+    // Native observers also report first measurements for newly rendered
+    // overscan rows while scroll events are still in flight.
+    for (const observer of observers) {
+      const entries = [...observer.elements].filter(element => element.hasAttribute('data-index')).map(element => ({
+        target: element, borderBoxSize: [{ blockSize: 44, inlineSize: 260 }],
+      })) as unknown as ResizeObserverEntry[]
+      if (entries.length) observer.callback(entries, {} as ResizeObserver)
+    }
+
+    const before = state.element.scrollTop
+    const firstVisibleIndex = Math.floor(before / 44)
+    const measured = [...state.element.querySelectorAll<HTMLElement>('[data-index]')]
+    const sizeChanges = measured.map(element => ({
+      element, index: Number(element.dataset.index), delta: element.dataset.index === '0' ? 4 : 6,
+    }))
+    const expectedAdjustment = sizeChanges.filter(item => item.index < firstVisibleIndex)
+      .reduce((sum, item) => sum + item.delta, 0)
+    const deliverWidth = (width: number) => {
+      for (const observer of observers) {
+        if (observer.elements.has(state.element)) observer.callback([{
+          target: state.element, borderBoxSize: [{ blockSize: 176, inlineSize: width }],
+        }] as unknown as ResizeObserverEntry[], {} as ResizeObserver)
+      }
+    }
+    const deliverResize = () => {
+      for (const observer of observers) {
+        const entries = sizeChanges.filter(item => observer.elements.has(item.element)).map(item => ({
+          target: item.element, borderBoxSize: [{ blockSize: 44 + item.delta, inlineSize: 272 }],
+        })) as unknown as ResizeObserverEntry[]
+        if (entries.length) observer.callback(entries, {} as ResizeObserver)
+      }
+    }
+    deliverWidth(272)
+    // Container and item observers can have a microtask checkpoint between
+    // deliveries. A nextTick-only restore would consume the anchor too early.
+    await nextTick()
+    deliverResize()
+    await flush()
+    // Only fully offscreen rows compensate. The partially visible row and the
+    // rows below it may grow without moving the reader's current position.
+    expect(expectedAdjustment).toBeGreaterThan(0)
+    expect(state.element.scrollTop).toBe(before + expectedAdjustment)
+    vi.mocked(state.element.scrollTo).mockClear()
+    deliverWidth(272)
+    deliverResize()
+    await flush()
+    expect(state.element.scrollTop).toBe(before + expectedAdjustment)
+    expect(state.element.scrollTo).not.toHaveBeenCalled()
+
+    // A wheel gesture takes precedence over a pending layout restoration.
+    deliverWidth(244)
+    state.element.dispatchEvent(new WheelEvent('wheel'))
+    state.element.scrollTop += 20
+    state.element.dispatchEvent(new Event('scroll'))
+    const userPosition = state.element.scrollTop
+    await flush()
+    expect(state.element.scrollTop).toBe(userPosition)
+    expect(state.element.scrollTo).not.toHaveBeenCalled()
+
+    const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame')
+    deliverWidth(272)
+    apps.pop()!.unmount()
+    await flush()
+    expect(cancelFrame).toHaveBeenCalled()
+    expect(state.element.scrollTo).not.toHaveBeenCalled()
+  })
+
+  it('lets an explicit reveal replace a pending width-change reading anchor', async () => {
+    const observers = recordResizeObservers()
+    const state = await mount()
+    // The old heading remains rendered even after navigating far away, so the
+    // pending frame must be cancelled rather than relying on a missing anchor.
+    for (const observer of observers) {
+      if (observer.elements.has(state.element)) observer.callback([{
+        target: state.element, borderBoxSize: [{ blockSize: 176, inlineSize: 272 }],
+      }] as unknown as ResizeObserverEntry[], {} as ResizeObserver)
+    }
+    await state.api.revealRow('task-175')
+    const revealedPosition = state.element.scrollTop
+    expect(revealedPosition).toBeGreaterThan(7000)
+    await flush()
+    expect(state.element.scrollTop).toBe(revealedPosition)
+    expect(state.keys()).toContain('task-175')
   })
 
   it('reveals by stable key and ignores a removed destination', async () => {

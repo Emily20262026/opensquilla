@@ -229,7 +229,7 @@ async function openChat(page: Page, expectedState: 'idle' | 'running' = 'idle') 
   const root = process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1'
     ? 'opensquilla-app://desktop/' : '/control/'
   await page.goto(`${root}chat?session=${encodeURIComponent(SESSION)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   const readyAction = expectedState === 'running'
     ? page.getByRole('button', { name: 'Stop current response' })
     : page.locator('.chat-send-btn[aria-label="Send"]')
@@ -257,6 +257,9 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     } else gateway.finish(status)
 
     await expect(stop).toHaveCount(0)
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText(
+      status === 'succeeded' ? 'Completed' : status === 'failed' ? 'Failed' : 'Interrupted',
+    )
     await expect(send).toBeEnabled()
     await expect(input).toHaveValue('Synthetic next request without changing projects.')
     await send.click()
@@ -267,10 +270,24 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     expect(page.url()).toBe(originalUrl)
     expect(gateway.connectionCount()).toBe(1)
     await expect(stop).toBeVisible()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
     gateway.finish('succeeded')
     await expect(send).toBeEnabled()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('Completed')
   })
 }
+
+test('switching away from a live chat does not announce completion', async ({ page }) => {
+  const gateway = await installGateway(page)
+  await openChat(page)
+  await page.locator('.chat-textarea').fill('Synthetic request while navigating.')
+  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect.poll(() => gateway.sends.length).toBe(1)
+  await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+  await page.locator('.sidebar-new-session').click()
+  await expect(page).toHaveURL(/\/chat\/new/)
+  await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
+})
 
 test('pending admission is visible and a rejected send restores an editable retry', async ({ page }) => {
   const gateway = await installGateway(page, true)
@@ -289,7 +306,7 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.msg-user')).toContainText('Synthetic request to retry.')
 
   gateway.rejectHeldSend()
-  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('The task did not finish. Please try again later.')
+  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('This request did not finish.')
   await expect(page.locator('body')).not.toContainText(REJECTION)
   await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
   await expect(input).toHaveValue('Synthetic request to retry.')
@@ -316,7 +333,7 @@ for (const { changeAuthority, reload, label } of [
     const input = page.locator('.chat-textarea')
     const send = page.locator('.chat-send-btn[aria-label="Send"]')
     gateway.disconnect()
-    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await input.fill('Synthetic never-sent offline draft.')
     await expect(send).toBeEnabled()
     await send.click()
@@ -327,7 +344,7 @@ for (const { changeAuthority, reload, label } of [
 
     gateway.reconnect(changeAuthority)
     if (reload) await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     if (changeAuthority) {
       await expect(page.locator('.chat-pending-save-status')).toContainText('changed')
       expect(gateway.sends).toHaveLength(0)
@@ -351,7 +368,7 @@ test('a new browser tab recovers the original identity and durable offline draft
   const gateway = await installGateway(page, false, true)
   await openChat(page)
   gateway.disconnect()
-  await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
   await page.locator('.chat-textarea').fill('Synthetic durable draft for a replacement tab.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')

@@ -47,6 +47,7 @@ import { AUDIO_TRANSCRIPTION_KEY } from './modules/audioTranscription'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { CONVERSATION_EVENTS_KEY } from './modules/conversationEvents'
 import { SESSION_READ_LIFECYCLE_FACTORY_KEY } from './modules/sessionReadLifecycle'
+import { SESSION_MESSAGE_SEARCH_KEY } from './modules/sessionMessageSearch'
 import { SESSION_INSPECTION_KEY } from './modules/sessionInspection'
 import { HISTORY_CONTENT_READER_KEY } from './modules/historyContent'
 import 'katex/dist/katex.min.css'
@@ -55,6 +56,7 @@ import './themes/tokens' // eagerly bundles every value theme's token block
 import './styles/control-visual-system.css'
 import './styles/route-fx.css'
 import './styles/chat-markdown.css'
+import './styles/chat-diagrams.css'
 import './styles/chat-shared.css'
 import './styles/apple-modern.css'
 
@@ -120,6 +122,7 @@ app.provide(
   gatewayAdapters.sessionReadLifecycleFactory,
 )
 app.provide(SESSION_INSPECTION_KEY, gatewayAdapters.sessionInspection)
+app.provide(SESSION_MESSAGE_SEARCH_KEY, gatewayAdapters.sessionMessageSearch)
 app.provide(HISTORY_CONTENT_READER_KEY, gatewayAdapters.historyContentReader)
 app.provide(
   SESSION_DIRECTORY_CHANGES_KEY,
