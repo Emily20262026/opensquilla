@@ -197,6 +197,7 @@
           :bottom-padding="24"
           :layout-header="threadHeaderRef"
           :messages="forkTransition?.previewMessages || findDisplayMessages"
+          :live-visualize-publications="forkTransition ? undefined : presentedLive.liveVisualizePublications"
           :find-fallback-index="findPresentation.fallbackIndex.value"
           :session-key="forkTransition?.parentKey || sessionKey"
           :content-cache-scope="deliveryIdentity"
@@ -440,6 +441,8 @@
             <div v-if="presentedLive.liveAnswerPart" class="live-answer">
               <StreamingTextPart
                 :raw-text="presentedLive.liveAnswerPart.rawText"
+                :visualize-receipts="presentedLive.liveVisualizeReceipts"
+                :session-key="sessionKey"
                 :render-markdown="renderMarkdown"
               />
             </div>
@@ -596,10 +599,6 @@
         <span>{{ t('chat.latest') }}</span>
       </button>
     </Transition>
-    <div v-if="slashOpen" ref="slashMenuRef">
-      <ChatSlashPalette :items="filteredSlashCmds" :active-index="slashIdx"
-        :loading="skillsLoading" :error="skillsError" @choose="completeSlashCmd" />
-    </div>
 
     <PendingQueue
       :items="pendingQueue"
@@ -705,6 +704,14 @@
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :selected-skills="selectedSkills"
+      :skill-positions="skillPositions"
+      :draft-key="sessionKey"
+      :skill-palette-items="composerSkillItems"
+      :skills-loading="skillsLoading"
+      :skills-error="skillsError"
+      :palette-open="slashOpen"
+      :palette-active-index="slashIdx"
+      :has-context="Boolean(visualizeDraft.snapshot.value)"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="gatewayAccess.canChooseProject"
       :plan-mode-available="planUiAvailable"
@@ -731,6 +738,8 @@
       @remove-attachment="removeAttachment"
       @remove-local-path="removeLocalPath"
       @remove-skill="selectedSkills = selectedSkills.filter(skill => skill.instanceId !== $event)"
+      @positions-change="skillPositions = $event"
+      @select-skill="selectComposerSkill"
       @retry-attachment="retryAttachment"
       @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
@@ -758,7 +767,19 @@
       @jump-prompt-annotation="jumpPromptAnnotation"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
-    />
+    >
+      <template #palette>
+        <div v-if="slashOpen" ref="slashMenuRef">
+          <ChatSlashPalette :items="filteredSlashCmds" :active-index="slashIdx"
+            :loading="skillsLoading" :error="skillsError" :selected-skills="selectedSkills"
+            :composer-element="composerRef?.editorElement()?.closest<HTMLElement>('.chat-input-panel')"
+            @close="closeSlashMenu(); composerRef?.focusTextarea()" @choose="completeSlashCmd" />
+        </div>
+      </template>
+      <template #context>
+        <VisualizeContextChip v-if="visualizeDraft.snapshot.value" :snapshot="visualizeDraft.snapshot.value" @remove="visualizeDraft.clear" />
+      </template>
+    </ChatComposer>
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
@@ -827,7 +848,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
+import { ref, computed, provide, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -867,6 +888,8 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import VisualizeContextChip from '@/components/chat/VisualizeContextChip.vue'
+import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
@@ -877,6 +900,8 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import { VISUALIZE_CONVERSATION_KEY } from '@/visualize/types'
+import { visualizeReceipts } from '@/visualize/receipts'
 import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
@@ -1223,6 +1248,9 @@ interface ChatComposerHandle {
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
   showSendBlockedHint: () => void
+  editorElement: () => HTMLElement | null
+  getSelection: () => { start: number; end: number; length: number }
+  setSelectionRange: (start: number, end: number) => void
 }
 
 type Message = ChatMessage
@@ -1592,6 +1620,7 @@ const promptAnnotationDesktopAvailable = computed(() => (
 ))
 const { inputText, composerText, localPaths, appendLocalPaths, removeLocalPath, restoreInput } = useLocalPathDraft()
 const selectedSkills = ref<SelectedSkillRef[]>([])
+const skillPositions = ref<Record<string, number>>({})
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
@@ -1709,7 +1738,7 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-const draftPersistence = useChatDraftPersistence({ sessionKey, inputText: composerText, localPaths, selectedSkills })
+const draftPersistence = useChatDraftPersistence({ sessionKey, inputText: composerText, localPaths, selectedSkills, skillPositions })
 const {
   elevatedMode,
   loadElevatedMode,
@@ -1976,6 +2005,10 @@ const sessionViewCache = useChatSessionViewCache({
   capturePresentation: captureSessionPresentation,
   captureViewport: captureSessionViewport,
 })
+const visualizeDraft = useVisualizeDraft({
+  sessionKey, deliveryIdentity, generation: sessionViewCache.generation,
+  available: key => visualizeConversationEnabled(key),
+})
 // Task events can confirm an owner before deferred session metadata arrives.
 // Keep that control fact separate from completion of the display snapshot.
 const presentationMetadataReady = ref(false)
@@ -2054,7 +2087,7 @@ const {
   prepareAttachmentsForSend,
 } = chatAttachments
 watch(
-  [inputText, composerText, localPaths, pendingAttachments, selectedSkills],
+  [inputText, composerText, localPaths, pendingAttachments, selectedSkills, visualizeDraft.snapshot],
   () => {
     composerRevision.value += 1
   },
@@ -3606,10 +3639,11 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 const chatSlashCommands = useChatSlashCommands({
   skillCatalog,
   selectedSkills,
-  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? composerText.value.length,
+  getCaret: () => composerRef.value?.getSelection().start ?? composerText.value.length,
+  onSelectSkill: (skill, position) => { skillPositions.value = { ...skillPositions.value, [skill.instanceId]: position } },
   setCaret: (position) => { void nextTick(() => {
     composerRef.value?.focusTextarea()
-    composerRef.value?.composerElement()?.querySelector('textarea')?.setSelectionRange(position, position)
+    composerRef.value?.setSelectionRange(position, position)
   }) },
   manageSkill: (name) => { void router.push({ path: '/skills', query: { skill: name } }) },
   commandCatalog,
@@ -3657,6 +3691,7 @@ const {
   slashOpen,
   slashIdx,
   skillCandidates,
+  skillPaletteItems,
   skillsLoading,
   skillsError,
   invalidateSkillCandidates,
@@ -3675,9 +3710,24 @@ const browserUseAvailable = computed(() => browserUseSupported.value
   && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
 
 function prepareAddMenu() {
-  if (!browserUseSupported.value) return
+  closeSlashMenu()
   invalidateSkillCandidates()
   void loadSkillCandidates()
+}
+
+const composerSkillItems = computed(() => skillPaletteItems.value.map(item => (
+  item.skill?.name === 'browser-use' && !browserUseSupported.value
+    ? { ...item, skill: { ...item.skill, ready: false, reasonCode: 'tools_unavailable' as const } }
+    : item
+)))
+
+async function selectComposerSkill(command: (typeof skillPaletteItems.value)[number]) {
+  if (!command.skill || (command.skill.name === 'browser-use' && !browserUseSupported.value)) return
+  const origin = sessionKey.value
+  if (chatSlashCommands.selectPaletteSkill(command) && origin === sessionKey.value) {
+    await nextTick()
+    composerRef.value?.focusTextarea()
+  }
 }
 
 async function selectBrowserUse() {
@@ -3721,6 +3771,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   localPathReferences: localPaths,
   restoreInput,
   textareaText: composerText,
+  getEditorSelection: () => composerRef.value?.getSelection() ?? null,
   composing,
   messages,
   pendingQueue,
@@ -3736,9 +3787,19 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   activateSlashCmd,
   popPendingTail,
   enqueuePendingInput: async text => {
+    const context = visualizeDraft.capture()
+    if (visualizeDraft.snapshot.value && !context) return false
+    const revision = composerRevision.value
+    if (context && !await acceptsVisualizeContext(text, classifySlashCommand)) return false
+    if (context && (!context.isCurrent() || composerRevision.value !== revision)) return false
     const resume = !isStopPending.value ? capturePendingAutoSendResume() : undefined
-    const queued = await enqueuePendingInput(text)
-    if (queued) resume?.()
+    const queued = await enqueuePendingInput(
+      context ? context.message(text, t('visualize.contextAttached')) : text,
+      undefined,
+      context && text.trim().startsWith('/') && !text.trim().startsWith('//')
+        ? { confirmedPlainText: true } : undefined,
+    )
+    if (queued) { context?.accepted(); resume?.() }
     return queued
   },
   sendCurrentInput: () => sendCurrentInput(),
@@ -4042,7 +4103,26 @@ async function onComposerSend() {
   }
   const target = replanTarget.value
   if (!target) {
-    onSend({ resumeQueueOnSuccess: !isStopPending.value, onAccepted: returnToLiveOnAccepted })
+    const context = visualizeDraft.capture()
+    // A visible attachment must not silently disappear from the submitted request
+    // during cached/read-only recovery. The normal Send gate owns the next retry.
+    if (visualizeDraft.snapshot.value && !context) return
+    const composer = inputText.value
+    const submittedRevision = composerRevision.value
+    // Only actual controls keep the attachment for a later question. Unknown
+    // slash text and the // escape are ordinary messages in the existing sender.
+    const withContext = context && await acceptsVisualizeContext(composer, classifySlashCommand)
+    if (context && (!context.isCurrent() || composerRevision.value !== submittedRevision)) return
+    void onSend({
+      resumeQueueOnSuccess: !isStopPending.value,
+      ...(withContext ? {
+        composerText: composer, textOverride: context.message(composer, t('visualize.contextAttached')),
+        consumeComposerOnQueue: true, cancelIfComposerChanged: true,
+        preflightGuard: context.isCurrent,
+        preDispatchGuard: context.isCurrent,
+      } : {}),
+      onAccepted: () => { if (withContext) context.accepted(); returnToLiveOnAccepted() },
+    })
     return
   }
   const prompt = inputText.value.trim()
@@ -4419,6 +4499,7 @@ function captureLivePresentation(key = sessionKey.value) {
   // Departure capture runs before scoped owners reset, but the route key has
   // already changed. Retain the outgoing task's disclosure identity explicitly.
   const turnKey = String(JSON.parse(liveToolStateScope.value)[1])
+  const liveVisualizeReceipts = visualizeReceipts(foldedTurn.value.toolCalls)
   return {
     visible: isStreaming.value && streamBubble.value && answerRevealOpen.value,
     liveActivityContinuityKey: assistantActivityContinuityKey(key, turnKey),
@@ -4439,6 +4520,8 @@ function captureLivePresentation(key = sessionKey.value) {
     liveReasoningCollapseActive: liveReasoningCollapseActive.value,
     toolInputPreviews: toolInputPreviews.value,
     liveAnswerPart: liveAnswerPart.value,
+    liveVisualizeReceipts,
+    liveVisualizePublications: { sessionKey: key, deliveryIdentity: deliveryIdentity.value, receipts: liveVisualizeReceipts },
     liveCurrentPhaseCode: liveCurrentPhaseCode.value,
     liveArtifacts: liveArtifacts.value,
     livePendingInterruptParts: livePendingInterruptParts.value,
@@ -5168,6 +5251,32 @@ function applyLandingSuggestion(text: string) {
   if (landingSuggestionsDisabled.value) return
   sendComposerText(text)
 }
+
+function visualizeConversationEnabled(key: string) {
+  return Boolean(key && key === sessionKey.value && gatewayAccess.isAvailable && !shareMode.value
+    && !sessionViewCache.showingPreview.value && sessionViewCache.ready.value
+    && !isSessionHydrating.value && taskOwnership.hydrationResolved.value
+    && !forkTransition.value && !goalDraftArmed.value && !replanActive.value && !dockedPlanQuestionnaire.value)
+}
+watch([goalDraftArmed, replanActive, dockedPlanQuestionnaire], ([goal, replan, questionnaire]) => {
+  if (goal || replan || questionnaire) visualizeDraft.clear()
+})
+provide(VISUALIZE_CONVERSATION_KEY, {
+  enabled: visualizeConversationEnabled,
+  attach(key, receipt, context) {
+    const attached = visualizeDraft.attach(key, receipt, context)
+    if (!attached) return false
+    if (!composerText.value.trim() && attached.suggestedPrompt) appendComposerText(attached.suggestedPrompt)
+    expandComposer()
+    nextTick(() => composerRef.value?.focusTextarea())
+    return true
+  },
+  draft(key, receipt, text) {
+    if (!visualizeConversationEnabled(key)) return false
+    appendComposerText(`${receipt.name}\n${text.slice(0, 4000)}`)
+    return true
+  },
+})
 
 function appendComposerText(text: string, paths?: readonly string[]) {
   const presentation = localPathPresentation(String(text || '').trim(), paths)
@@ -6833,10 +6942,10 @@ function handleLongPastedInput(text: string, event?: InputEvent): boolean {
     : text
   if (!isLongPlainTextPaste(pastedText)) return false
 
-  if (event?.target instanceof HTMLTextAreaElement
-    && typeof event.data === 'string'
+  if (typeof event?.data === 'string'
     && event.data.length > 0) {
-    const caret = event.target.selectionStart
+    const caret = event.target instanceof HTMLTextAreaElement
+      ? event.target.selectionStart : composerRef.value?.getSelection().start ?? text.length
     const start = Math.max(0, caret - event.data.length)
     composerText.value = `${text.slice(0, start)}${text.slice(caret)}`
   } else {
@@ -6862,6 +6971,7 @@ function onDocumentPaste(e: ClipboardEvent) {
   // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
   if (!shouldCaptureFilePaste(e.target, {
     composerTextareaFocused: composerRef.value?.isTextareaFocused() ?? false,
+    composerEditor: composerRef.value?.editorElement(),
     dialogLayerOpen: hasOpenDialogLayer(),
   })) return
   const files = collectClipboardFiles(e.clipboardData)
@@ -6929,7 +7039,7 @@ function onDocumentKeydown(e: KeyboardEvent) {
   const editableTarget = target instanceof HTMLInputElement
     || target instanceof HTMLSelectElement
     || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
-    || (target instanceof HTMLElement && target.isContentEditable)
+    || (target instanceof HTMLElement && target.isContentEditable && !composerRef.value?.isTextareaFocused())
   if (editableTarget) return
 
   if (canStop.value) {
@@ -7522,7 +7632,7 @@ onUnmounted(() => {
   }
 })
 
-useDocumentEvent('paste', onDocumentPaste)
+useDocumentEvent('paste', onDocumentPaste, true)
 useDocumentEvent('keydown', onDocumentKeydown)
 
 // Watch for route changes

@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/chat/new'
 
@@ -24,7 +25,7 @@ test('clipboard paste restores send readiness after stale IME composition', asyn
   await textarea.dispatchEvent('compositionstart')
   await page.keyboard.press('ControlOrMeta+V')
 
-  await expect(textarea).toHaveValue(pastedText)
+  await expectComposerValue(textarea, pastedText)
   await expect(sendButton).toHaveClass(/is-ready/)
 })
 
@@ -45,7 +46,7 @@ test('long plain-text clipboard paste becomes a pasted-text attachment', async (
   const chip = page.locator('.attachment-chip')
   await expect(chip).toHaveCount(1)
   await expect(chip).toContainText('Pasted text')
-  await expect(textarea).toHaveValue('')
+  await expectComposerValue(textarea, '')
 })
 
 test('post-insertion paste fallback attaches text before send', async ({ page }) => {
@@ -58,18 +59,24 @@ test('post-insertion paste fallback attaches text before send', async ({ page })
   const textarea = page.locator('.chat-textarea')
   const instruction = 'Summarize the pasted text: '
   const pastedText = `${'fallback paste content\n'.repeat(900)}tail`
-  await textarea.evaluate((element, value) => {
-    const field = element as HTMLTextAreaElement
-    field.value = value
-    field.dispatchEvent(new InputEvent('input', {
+  // Seed the post-insertion DOM and caret without routing the large payload
+  // through a normal fill event, then deliver the paste-shaped input event
+  // that the long-paste fallback consumes.
+  await textarea.evaluate((element, payload) => {
+    element.textContent = payload.fullText
+    const setSelectionRange = (element as HTMLElement & {
+      setSelectionRange?: (start: number, end?: number) => void
+    }).setSelectionRange
+    setSelectionRange?.call(element, payload.fullText.length, payload.fullText.length)
+    element.dispatchEvent(new InputEvent('input', {
       bubbles: true,
       inputType: 'insertFromPaste',
-      data: value.slice(value.indexOf('fallback')),
+      data: payload.pastedText,
     }))
-  }, `${instruction}${pastedText}`)
+  }, { fullText: `${instruction}${pastedText}`, pastedText })
 
   const chip = page.locator('.attachment-chip')
   await expect(chip).toHaveCount(1)
   await expect(chip).toContainText('Pasted text')
-  await expect(textarea).toHaveValue(instruction)
+  await expectComposerValue(textarea, instruction)
 })

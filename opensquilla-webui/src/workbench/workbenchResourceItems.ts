@@ -23,6 +23,18 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
 }
 
 /**
+ * A show_widget Document is an internal recovery snapshot for the inline
+ * Visualize canvas.  It remains addressable by its document identity, but it
+ * is not a user-facing file and therefore must not appear in Files.  The
+ * explicit source namespace is the classification boundary; visibility and
+ * presentation describe how that resource is used but are not sufficient to
+ * hide an unrelated internal inline resource.
+ */
+export function isInternalVisualizeResource(resource: WorkbenchResource): boolean {
+  return resource.source?.split('_').join('-').startsWith('show-widget') === true
+}
+
+/**
  * Collapse only server-declared resource lineages for navigation. Raw resource
  * identities remain available to transcript cards, downloads and audit views.
  * Names and content hashes are intentionally ignored: two unrelated files may
@@ -31,12 +43,13 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
 export function canonicalWorkbenchResources(
   resources: readonly WorkbenchResource[],
 ): WorkbenchResource[] {
+  const userFacingResources = resources.filter(resource => !isInternalVisualizeResource(resource))
   const documentIds = new Set(
-    resources
+    userFacingResources
       .filter(resource => resource.resource.type === 'document')
       .map(resource => workbenchResourceRefId(resource.resource)),
   )
-  return resources.filter((resource) => {
+  return userFacingResources.filter((resource) => {
     if (resource.resource.type === 'document') return true
     const documentId = resource.relations.documentId || ''
     return !documentId || !documentIds.has(documentId)

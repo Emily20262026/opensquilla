@@ -7,6 +7,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:e2e-send-lifecycle'
 const GENERATION = 'send-lifecycle-generation'
@@ -261,7 +262,7 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
       status === 'succeeded' ? 'Completed' : status === 'failed' ? 'Failed' : 'Interrupted',
     )
     await expect(send).toBeEnabled()
-    await expect(input).toHaveValue('Synthetic next request without changing projects.')
+    await expectComposerValue(input, 'Synthetic next request without changing projects.')
     await send.click()
     await expect.poll(() => gateway.sends.length).toBe(2)
     expect(gateway.sends[1]).toMatchObject({
@@ -309,7 +310,7 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('This request did not finish.')
   await expect(page.locator('body')).not.toContainText(REJECTION)
   await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
-  await expect(input).toHaveValue('Synthetic request to retry.')
+  await expectComposerValue(input, 'Synthetic request to retry.')
   await expect(send).toBeEnabled()
   await expect(page.locator('.chat-composer-send-pending')).toHaveCount(0)
   await expect(page.locator('.chat-send-tooltip')).toHaveCount(0)
@@ -338,7 +339,7 @@ for (const { changeAuthority, reload, label } of [
     await expect(send).toBeEnabled()
     await send.click()
     await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
-    await expect(input).toHaveValue('')
+    await expectComposerValue(input, '')
     expect(gateway.sends).toHaveLength(0)
     expect(gateway.enqueues).toHaveLength(0)
 
@@ -401,7 +402,9 @@ test('unified slash selects bilingual skills lazily and shows real load receipts
   const input = page.locator('.chat-textarea')
   await input.fill('/')
   await expect(page.locator('.chat-slash-item[data-skill-name]')).toHaveCount(12)
-  await expect(page.locator('.chat-slash-group').filter({ hasText: 'Skills' })).toHaveText('Skills 12')
+  // The group heading intentionally contains only its localized label; the
+  // item count is asserted by the locator immediately above.
+  await expect(page.locator('.chat-slash-group').filter({ hasText: 'Skills' })).toHaveText('Skills')
   const lastSkill = page.locator('[role="option"][data-skill-name="synthetic-skill-11"]')
   await lastSkill.scrollIntoViewIfNeeded()
   await expect(lastSkill).toBeInViewport()
@@ -410,21 +413,23 @@ test('unified slash selects bilingual skills lazily and shows real load receipts
   const option = page.locator('[role="option"][data-skill-name="xlsx"]')
   await expect(option).toHaveCSS('display', 'flex')
   await expect(option).toHaveCSS('border-top-width', '0px')
-  await expect(option.locator('.chat-slash-desc')).toHaveCSS('text-overflow', 'ellipsis')
-  await expect(option.locator('.chat-slash-desc')).toHaveCSS('white-space', 'nowrap')
+  await expect(option.locator('.composer-capability__description')).toHaveCSS('text-overflow', 'ellipsis')
+  await expect(option.locator('.composer-capability__description')).toHaveCSS('white-space', 'nowrap')
   expect((await option.boundingBox())!.height).toBeLessThanOrEqual(44)
   expect(gateway.candidateCalls()).toBe(1)
   await input.fill('Analyze /SPREADSHEET')
   await page.locator('[role="option"][data-skill-name="xlsx"]').click()
-  await expect(input).toHaveValue('Analyze ')
-  await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
-  await expect(page.getByTestId('selected-skills')).toHaveCSS('display', 'flex')
-  await expect(page.getByTestId('selected-skills')).toHaveCSS('flex-wrap', 'wrap')
+  await expectComposerValue(input, 'Analyze ')
+  const selectedSkills = page.locator('.chat-inline-editor__skill[data-skill-id]')
+  await expect(selectedSkills).toHaveCount(1)
+  await expect(selectedSkills).toContainText('xlsx')
+  await expect(selectedSkills).toHaveCSS('display', 'inline-flex')
+  await expect(selectedSkills).toHaveCSS('white-space', 'nowrap')
   expect(gateway.candidateCalls()).toBe(1)
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect.poll(() => gateway.sends.length).toBe(1)
   expect(gateway.sends[0]?.selectedSkills).toEqual([SKILL])
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(selectedSkills).toHaveCount(0)
   await expect(page.getByTestId('sent-selected-skills')).toHaveCSS('display', 'flex')
   await expect(page.getByTestId('sent-selected-skills')).toHaveCSS('flex-wrap', 'wrap')
   await expect(page.getByTestId('skill-load-status')).toHaveCount(0)
@@ -463,13 +468,15 @@ test('skill drafts survive refresh and narrow palettes preserve the surrounding 
   expect(bounds!.x).toBeGreaterThanOrEqual(0)
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(360)
   await input.press('Enter')
-  await expect(input).toHaveValue('Analyze  carefully')
+  await expectComposerValue(input, 'Analyze  carefully')
   await page.reload()
-  await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
-  await expect(input).toHaveValue('Analyze  carefully')
+  const selectedSkills = page.locator('.chat-inline-editor__skill[data-skill-id]')
+  await expect(selectedSkills).toHaveCount(1)
+  await expect(selectedSkills).toContainText('xlsx')
+  await expectComposerValue(input, 'Analyze  carefully')
   expect(gateway.sends).toHaveLength(0)
   await page.getByRole('button', { name: 'Remove xlsx from this message' }).click()
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(selectedSkills).toHaveCount(0)
 })
 
 test('busy skill messages enter the durable queue and retain their exact identity on dispatch', async ({ page }) => {
@@ -489,7 +496,7 @@ test('busy skill messages enter the durable queue and retain their exact identit
   })
   expect(gateway.sends).toHaveLength(1)
   await expect(page.locator('.chat-pending')).toContainText('xlsx')
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(page.locator('.chat-inline-editor__skill[data-skill-id]')).toHaveCount(0)
   gateway.finish('succeeded')
   await expect.poll(() => gateway.sends.length).toBe(2)
   expect(gateway.dispatches).toHaveLength(1)

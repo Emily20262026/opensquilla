@@ -9507,6 +9507,7 @@ class TurnRunner:
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9679,6 +9680,7 @@ class TurnRunner:
             runtime_info=runtime_info,
             docs_path=(self._resolve_docs_path()),
             heartbeat_prompt=(getattr(self._config, "heartbeat_prompt", None)),
+            webui_rendering=webui_rendering,
         )
         # daily_notes, workspace_files, and extra_context are per-turn /
         # per-day volatile content. Keeping them in the cacheable base

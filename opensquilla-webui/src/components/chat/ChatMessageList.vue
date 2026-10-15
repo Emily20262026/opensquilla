@@ -227,6 +227,8 @@ import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/t
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { ContentRangeCache, type ContentRangeRef } from '@/utils/chat/contentRangeCache'
 import { HISTORY_CONTENT_READER_KEY } from '@/modules/historyContent'
+import { provideVisualizeMessagePins } from '@/visualize/presentation'
+import { provideVisualizeVersions, type VisualizeLivePublications } from '@/visualize/versions'
 import { restoreHistoryTimelineText } from '@/utils/chat/historyMessageContent'
 import {
   isUsageAccountingBarrierMessage,
@@ -237,6 +239,7 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
+  liveVisualizePublications?: VisualizeLivePublications
   findFallbackIndex?: number
   /** Cached history cannot authorize actions; fresh live controls stay outside these rows. */
   previewReadOnly?: boolean
@@ -418,6 +421,8 @@ function assistantRegenerateAvailable(index: number): boolean {
 }
 
 const listRootRef = ref<HTMLElement | null>(null)
+const visualizePinnedMessageKeys = provideVisualizeMessagePins(listRootRef)
+provideVisualizeVersions(() => props.sessionKey, () => props.messages, () => props.liveVisualizePublications)
 const slots = useSlots()
 const scrollMargin = ref(0)
 const measurementVersion = ref(0)
@@ -772,6 +777,7 @@ const forcedIndexes = computed(() => {
       || layoutAnchorKey.value === key
       || props.forceMountMessageKeys?.has(key)
       || (props.previewReadOnly && props.restoredViewport?.anchor?.key === key)
+      || visualizePinnedMessageKeys.value.has(key)
       || message.isStreaming || message.maintenance?.state === 'running'
       || message.parts?.some(part => part.type === 'interrupt' && !part.resolution)
     ) forced.add(index)
