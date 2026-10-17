@@ -72,9 +72,9 @@ export function createResourceCollectionWorkbenchItem(options: {
     title: options.title,
     scope: { type: 'session', id: options.sessionKey },
     hostKind: 'dom',
-    retention: 'keep-alive',
+    retention: 'dispose-on-suspend',
     payload: {
-      resources,
+      resourceCount: resources.length,
       sessionKey: options.sessionKey,
     },
   }
@@ -92,6 +92,20 @@ export function resourcesFromWorkbenchItem(
         && 'resource' in resource,
       ))
     : []
+}
+
+/** Refresh inventory without changing the visible owner or resource authority. */
+export function refreshResourceCollectionWorkbenchItem(
+  item: WorkbenchItem,
+  resources: readonly WorkbenchResource[],
+  title: string,
+): WorkbenchItem {
+  if (item.kind !== 'resource-collection') return item
+  return {
+    ...item,
+    title,
+    payload: { sessionKey: item.payload.sessionKey, resourceCount: canonicalWorkbenchResources(resources).length },
+  }
 }
 
 /**

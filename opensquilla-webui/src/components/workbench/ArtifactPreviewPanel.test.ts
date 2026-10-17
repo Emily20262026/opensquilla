@@ -26,6 +26,10 @@ import { ARTIFACT_DOCUMENT_RPC_METHODS, createRpcArtifactDocumentProvider } from
 import officeRevisionWire from '@/testing/fixtures/officeRevisionPreview/wire.json'
 
 vi.mock('@/workbench/officePreviewAdapter', () => ({ createOfficePreviewSession: vi.fn() }))
+vi.mock('./PdfResourcePreview.vue', () => ({ __esModule: true, default: {
+  props: ['data', 'name'], setup: (props: { data: ArrayBuffer }) =>
+    () => h('div', { 'data-testid': 'shared-pdf', 'data-bytes': props.data.byteLength }),
+} }))
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -81,6 +85,41 @@ afterEach(() => {
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it.each(['pdf', 'docx', 'pptx', 'xlsx'] as const)('does not reload %s for HTML preferences but still reloads a new revision', async format => {
+    const mime = format === 'pdf' ? 'application/pdf' : OFFICE_PREVIEW_MIMES[format]
+    vi.mocked(createOfficePreviewSession).mockResolvedValue({
+      goTo: vi.fn(), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null), renderThumbnail: vi.fn(), fitPage: vi.fn(),
+      destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), resize: vi.fn(), fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(),
+      setSelectionMode: vi.fn(), clearSelection: vi.fn(),
+    })
+    const requestBinary = vi.fn(async () => httpBinaryResponse(new Uint8Array([1, 2, 3, 4]), { contentType: mime }))
+    const selected = artifact({ name: `reader.${format}`, mime, revisionId: 'original' })
+    const mounted = mountPanel({ artifact: selected, previewMode: 'offline' }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    mounted.update({ previewMode: 'full', previewNetworkAllowed: false, previewSandboxProfile: 'opaque-offline' })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    mounted.update({ artifact: { ...selected, revisionId: 'updated' } })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
+
+  it('continues reloading HTML when its execution mode changes', async () => {
+    const requestBinary = vi.fn(async () => httpBinaryResponse('<!doctype html><p>Mode change</p>', { contentType: 'text/html' }))
+    const onNativeHtmlReady = vi.fn()
+    const mounted = mountPanel({ artifact: artifact(), nativeHtml: true, previewMode: 'offline', onNativeHtmlReady },
+      httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+    expect(onNativeHtmlReady).toHaveBeenCalledOnce()
+    mounted.update({ previewMode: 'full' })
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    expect(onNativeHtmlReady).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
   it.each([
     { surface: 'Web iframe', nativeHtml: false, source: 'partial lease', lease: true },
     { surface: 'Desktop native', nativeHtml: true, source: 'partial lease', lease: true },
@@ -332,7 +371,7 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
-  it('opens PDFs fitted to the panel width without disabling frame interaction', async () => {
+  it('uses the shared interactive PDF renderer with authorized bytes', async () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank?pdf-preview')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
@@ -349,30 +388,13 @@ describe('ArtifactPreviewPanel', () => {
     }, http)
     await settlePreview()
 
-    const frame = mounted.element.querySelector<HTMLIFrameElement>(
-      '.artifact-preview__frame--pdf',
-    )!
-    expect(frame.getAttribute('src')).toBe(
-      'about:blank?pdf-preview#zoom=page-width&view=FitH',
-    )
-    expect(frame.getAttribute('aria-hidden')).toBeNull()
-    expect(frame.getAttribute('tabindex')).toBe('0')
-    expect(frame.classList.contains('is-mobile-inert')).toBe(false)
-
-    const frameExit = mounted.element.querySelector<HTMLButtonElement>(
-      '.artifact-preview__frame-exit',
-    )!
-    expect(frame.compareDocumentPosition(frameExit) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy()
-    expect(frameExit.textContent?.trim()).toBe('Collapse workbench')
-    frameExit.focus()
-    expect(document.activeElement).toBe(frameExit)
-    frameExit.click()
-    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'request-collapse' })
+    await vi.waitFor(() => expect(mounted.element.querySelector('[data-testid=shared-pdf]')).not.toBeNull())
+    expect(mounted.element.querySelector('iframe')).toBeNull()
+    expect(mounted.element.querySelector('[data-testid=shared-pdf]')?.getAttribute('data-bytes')).toBe('4')
     mounted.unmount()
   })
 
-  it('shows a useful fallback when the browser disables inline PDF viewing', async () => {
+  it('keeps PDF previews available when the browser disables its native plugin', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(window.navigator, 'pdfViewerEnabled')
     Object.defineProperty(window.navigator, 'pdfViewerEnabled', {
       configurable: true,
@@ -391,9 +413,9 @@ describe('ArtifactPreviewPanel', () => {
       }, http)
       await settlePreview()
 
-      expect(mounted.element.querySelector('.artifact-preview__frame--pdf')).toBeNull()
-      expect(mounted.element.querySelector('[role="alert"]')?.textContent)
-        .toContain(en.workbench.artifactPreview.pdfViewerUnavailable)
+      await vi.waitFor(() => expect(mounted.element.querySelector('[data-testid=shared-pdf]')).not.toBeNull())
+      expect(mounted.element.querySelector('iframe')).toBeNull()
+      expect(mounted.element.querySelector('[role="alert"]')).toBeNull()
       mounted.unmount()
     } finally {
       if (descriptor) Object.defineProperty(window.navigator, 'pdfViewerEnabled', descriptor)

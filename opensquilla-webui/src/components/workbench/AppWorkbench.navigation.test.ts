@@ -10,17 +10,30 @@ import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import { artifactFromWorkbenchItem, artifactWorkbenchItemId, createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
+import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchResource, WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
 import AppWorkbench from './AppWorkbench.vue'
 
-const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false } }))
+const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false, runtime: false } }))
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
-vi.mock('@/workbench/runtime', async importOriginal => ({
-  ...await importOriginal<typeof import('@/workbench/runtime')>(),
-  attachWorkbenchRuntime: () => async () => {},
-}))
+vi.mock('@/workbench/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@/workbench/runtime')>()
+  return {
+    ...original,
+    attachWorkbenchRuntime: (...args: Parameters<typeof original.attachWorkbenchRuntime>) =>
+      previewHarness.runtime ? original.attachWorkbenchRuntime(...args) : async () => {},
+  }
+})
+// Keep the real collection runtime and event routing; preview-engine I/O is
+// outside this host integration test (the document panel is stubbed below).
+vi.mock('./artifactWorkbenchProvider', async importOriginal => {
+  const original = await importOriginal<typeof import('./artifactWorkbenchProvider')>()
+  return { ...original, createArtifactWorkbenchDefinitions: (options: Parameters<typeof original.createArtifactWorkbenchDefinitions>[0]) =>
+    original.createArtifactWorkbenchDefinitions({ ...options, previewLeasesEnabled: false }),
+  }
+})
 // Exercise AppWorkbench's real actions slot without mounting preview engines.
 vi.mock('./WorkbenchHost.vue', async () => {
   const { defineComponent, h } = await import('vue')
@@ -72,23 +85,26 @@ function opened(artifact = target): WorkbenchResourceOpenResponse {
 }
 async function flush() { for (let i = 0; i < 8; i += 1) { await Promise.resolve(); await nextTick() } }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
-async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean } = {}) {
+async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean; resourceSessionKey?: string } = {}) {
   const nextArtifact = options.target || target
+  const resourceSessionKey = options.resourceSessionKey || 'session-a'
   const pinia = createPinia()
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
-  const item = createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: 'session-a',
-    navigationArtifacts: [current, nextArtifact], ...(options.canonicalCurrent ? { resourceIdentity: 'document:current-doc' } : {}) })
+  const item = { ...createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: resourceSessionKey,
+    navigationArtifacts: [current, nextArtifact], ...(options.canonicalCurrent ? { resourceIdentity: 'document:current-doc' } : {}) }),
+    scope: { type: 'session', id: 'session-a' } as const }
   store.openItem(item)
   const resources = useWorkbenchResourcesStore(pinia)
   const resolve = vi.spyOn(resources, 'resolve').mockResolvedValue(resource(nextArtifact))
   const openCurrent = vi.spyOn(resources, 'openCurrent').mockResolvedValue(opened(nextArtifact))
   const host = document.createElement('div'); document.body.append(host)
+  const fetchArtifact = vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['download']) })
   const app = createApp(AppWorkbench, { sessionId: 'session-a', routeActive: true, workbenchResourcesEnabled: options.resourcesEnabled ?? true })
   app.use(pinia)
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.provide(ARTIFACT_WORKBENCH_KEY, {
-    documents: null, resources: null, content: {}, previews: {},
+    documents: null, resources: null, content: { fetchArtifact }, previews: {},
     subscribeDocumentChanges: () => ({ close() {} }),
   } as unknown as ArtifactWorkbench)
   app.mount(host); apps.push(app)
@@ -96,20 +112,138 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const select = () => host.querySelector<HTMLSelectElement>('[data-testid="workbench-artifact-switcher"]')
   const choose = async () => {
     const picker = select()!
-    picker.value = artifactWorkbenchItemId('session-a', nextArtifact)
+    picker.value = artifactWorkbenchItemId(resourceSessionKey, nextArtifact)
     picker.dispatchEvent(new Event('change', { bubbles: true }))
     await flush()
   }
-  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose }
+  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose, fetchArtifact }
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks(); pushToast.mockClear()
   previewHarness.enabled = false
+  previewHarness.runtime = false
 })
 
 describe('AppWorkbench artifact navigation', () => {
+  it.each([target, { id: 'listed-html', name: 'listed.html', mime: 'text/html' }].flatMap(artifact =>
+    ['session-a', 'agent:main:sidechat:child'].map(resourceSessionKey => ({ artifact, name: artifact.name, resourceSessionKey })),
+  ))(
+    'opens listed $name with $resourceSessionKey authority through the mounted panel', async ({ artifact, resourceSessionKey }) => {
+      previewHarness.enabled = true
+      previewHarness.runtime = true
+      const h = await mount({ target: artifact })
+      const listed = resource(artifact)
+      // A side collection is visible in the parent, but must never render or
+      // read the parent's inventory. Keep different records in both stores.
+      h.resources.snapshots['session-a'] = {
+        sessionKey: 'session-a', available: true, loading: false, loaded: true,
+        error: null, resources: [resource({ id: 'parent-only', name: 'parent-only.html', mime: 'text/html' })], totalCount: 1,
+      }
+      h.resources.snapshots[resourceSessionKey] = {
+        sessionKey: resourceSessionKey, available: true, loading: false, loaded: true,
+        error: null, resources: [listed], totalCount: 1,
+      }
+      const load = vi.spyOn(h.resources, 'load')
+      const retain = vi.spyOn(h.resources, 'retain')
+      const collection = createResourceCollectionWorkbenchItem({
+        sessionKey: resourceSessionKey, title: 'Files', resources: [listed],
+      })
+      collection.scope = { type: 'session', id: 'session-a' }
+      h.store.openItem(collection)
+      await flush()
+      const entry = h.host.querySelector<HTMLButtonElement>('.resource-collection__open')
+      expect(entry?.textContent).toContain(artifact.name)
+      expect(h.host.querySelector('.resource-collection')?.textContent).not.toContain('parent-only.html')
+      await vi.waitFor(() => expect(load).toHaveBeenCalledWith(resourceSessionKey))
+      expect(retain).toHaveBeenCalledWith(resourceSessionKey)
+      expect(load.mock.calls.every(([key]) => key === resourceSessionKey)).toBe(true)
+      expect(retain.mock.calls.every(([key]) => key === resourceSessionKey)).toBe(true)
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:download')
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+      h.host.querySelector<HTMLButtonElement>(`[aria-label="Download ${artifact.name}"]`)!.click()
+      await flush()
+      await vi.waitFor(() => expect(h.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: artifact.id }), { sessionKey: resourceSessionKey }))
+      expect(h.resolve).toHaveBeenCalledWith(resourceSessionKey, listed.resource)
+      expect(h.store.activeItemId).toBe(collection.id)
+
+      h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+      entry!.click()
+      await flush()
+      expect(h.openCurrent).toHaveBeenCalledWith(resourceSessionKey, listed)
+      expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
+      expect(h.store.activeItemId).toBe(collection.id)
+      h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
+      await flush()
+      expect(h.openCurrent).toHaveBeenCalledTimes(2)
+      expect(h.store.activeItem?.kind).toBe('artifact-preview')
+      expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+      expect(h.store.activeItem?.payload.sessionKey).toBe(resourceSessionKey)
+      expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
+        id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
+      })
+    },
+  )
+
+  it.each([target, { id: 'side-html', name: 'side.html', mime: 'text/html' }])(
+    'navigates side $name using child authorization while retaining parent visibility', async artifact => {
+      const child = 'agent:main:sidechat:child'
+      const h = await mount({ target: artifact, resourceSessionKey: child })
+      await h.choose()
+      expect(h.resolve).toHaveBeenCalledWith(child, { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
+      expect(h.openCurrent).toHaveBeenCalledWith(child, resource(artifact))
+      const active = h.store.activeItem!
+      expect(active.scope).toEqual({ type: 'session', id: 'session-a' })
+      expect(active.payload.sessionKey).toBe(child)
+      expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: 'canonical-head', documentId: 'canonical-doc' })
+      expect(h.store.visibleItems).toContainEqual(active)
+      expect(h.store.activeSessionId).toBe('session-a')
+    },
+  )
+
+  it('keeps child authorization and parent visibility on legacy side preview navigation', async () => {
+    const child = 'agent:main:sidechat:child'
+    const h = await mount({ resourceSessionKey: child })
+    h.resolve.mockResolvedValueOnce(null)
+    await h.choose()
+    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId(child, target))
+    expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+    expect(h.store.activeItem?.payload.sessionKey).toBe(child)
+  })
+
+  it('keeps side preview scope after importing an editable delivery', async () => {
+    const child = 'agent:main:sidechat:child'
+    const h = await mount({ resourceSessionKey: child })
+    const result = opened()
+    if (result.disposition !== 'document') throw new Error('Expected document fixture')
+    h.openCurrent.mockResolvedValueOnce(null)
+    const imported = vi.spyOn(h.resources, 'importDocument').mockResolvedValue({
+      document: result.document, revision: result.revision,
+    } as Awaited<ReturnType<typeof h.resources.importDocument>>)
+    await h.choose()
+    expect(imported).toHaveBeenCalledWith(child, resource())
+    expect(h.store.activeItem?.payload.sessionKey).toBe(child)
+    expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
+  })
+
+  it.each(['close origin', 'change session'] as const)(
+    'drops side navigation after %s while the child resource is resolving', async invalidation => {
+      const h = await mount({ resourceSessionKey: 'agent:main:sidechat:child' })
+      const pending = deferred<WorkbenchResource | null>()
+      h.resolve.mockReturnValueOnce(pending.promise)
+      await h.choose()
+      expect(h.resolve).toHaveBeenCalledTimes(1)
+      if (invalidation === 'close origin') h.store.closeItem(h.item.id)
+      else h.store.setSessionScope('session-b')
+      pending.resolve(resource()); await flush()
+      expect(h.openCurrent).not.toHaveBeenCalled()
+      expect(h.store.items.map(item => item.id)).toEqual(invalidation === 'close origin' ? [] : [h.item.id])
+      expect(h.store.visibleItems).toHaveLength(0)
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([false, true])('retires an Office thumbnail when its document head changes (inactive=%s)', async inactive => {
     previewHarness.enabled = true
     vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:old-office').mockReturnValueOnce('blob:new-office')
@@ -226,7 +360,8 @@ describe('AppWorkbench artifact navigation', () => {
     else h.store.setSessionScope('session-b')
     pending.resolve(resource()); await flush()
     expect(h.openCurrent).not.toHaveBeenCalled()
-    expect(h.store.items).toHaveLength(0)
+    expect(h.store.items.map(item => item.id)).toEqual(invalidation === 'close origin' ? [] : [h.item.id])
+    expect(h.store.visibleItems).toHaveLength(0)
     expect(pushToast).not.toHaveBeenCalled()
   })
 

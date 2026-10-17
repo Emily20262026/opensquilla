@@ -69,7 +69,7 @@
         />
         <UserMessage
           v-else-if="messages[entry.index].displayRole === 'user'"
-          :id="`chat-turn-${entry.index}`"
+          :id="messageAnchorId(entry.index)"
           :data-chat-turn-key="chatMessageKey(messages[entry.index], entry.index)"
           tabindex="-1"
           :message="hydratedMessage(messages[entry.index], entry.index)"
@@ -82,6 +82,7 @@
           :session-key="sessionKey"
           :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :is-streaming="isStreaming"
+          :edit-available="policy.edit && messageEditingAvailable"
           :is-goal-source="isGoalSource(messages[entry.index])"
           :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
           :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
@@ -90,7 +91,9 @@
           @edit="$emit('editMessage', $event)"
           @edit-attachment="$emit('editAttachment', $event)"
           @preview-attachment="$emit('previewAttachment', $event)"
-          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
+          @preview-image="(attachment, preview) => preview
+            ? $emit('previewImage', attachment, messages[entry.index].attachments || [], preview)
+            : $emit('previewImage', attachment, messages[entry.index].attachments || [])"
           @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
@@ -118,19 +121,19 @@
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
-          :regenerate-available="assistantRegenerateAvailable(entry.index)"
-          :is-tip="isForkableAssistant(entry.index)"
+          :regenerate-available="policy.retry && regenerationAvailable !== false && assistantRegenerateAvailable(entry.index)"
+          :is-tip="policy.fork && forkAvailable !== false && isForkableAssistant(entry.index)"
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
-          :plan-actions-disabled="planActionsDisabled"
+          :plan-actions-disabled="!policy.plan || planActionsDisabled"
           :plan-presentations="planPresentations"
-          :plan-presentation-available="planPresentationAvailable && !shareMode"
+          :plan-presentation-available="policy.plan && planPresentationAvailable && !shareMode"
           :plan-presentation-pending="planPresentationPending"
           :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :has-error-notice="hasTurnErrorNotice(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
-          :goal-removable="goalRemovable && !shareMode"
+          :goal-removable="policy.goal && goalRemovable && !shareMode"
           :goal-busy="goalBusy"
           :resolve-session-availability="resolveSessionAvailability"
           :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
@@ -184,6 +187,7 @@
 
 <script setup lang="ts">
 import SkillLoadStatus from './SkillLoadStatus.vue'
+import { useConversationPolicy } from '@/modules/conversationPolicy'
 import {
   computed,
   inject,
@@ -193,6 +197,7 @@ import {
   onUpdated,
   reactive,
   ref,
+  useId,
   useSlots,
   watch,
   type ComponentPublicInstance,
@@ -219,7 +224,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
-import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
+import { captureElementScrollAnchor, captureVisibleTextScrollAnchor, restoreElementScrollAnchor, restoreTextScrollAnchor, type ElementScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
 import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 import type { ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
@@ -237,7 +242,7 @@ import {
 import { defaultRangeExtractor, elementScroll, measureElement as measureVirtualElement, observeElementOffset, observeElementRect, useVirtualizer, type Rect, type ScrollToOptions, type Virtualizer } from '@tanstack/vue-virtual'
 import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   messages: ChatRenderedMessage[]
   liveVisualizePublications?: VisualizeLivePublications
   findFallbackIndex?: number
@@ -245,6 +250,9 @@ const props = defineProps<{
   previewReadOnly?: boolean
   loadHistoryDetails?: (message: ChatRenderedMessage) => Promise<void>
   shareMode: boolean
+  messageEditingAvailable?: boolean
+  regenerationAvailable?: boolean
+  forkAvailable?: boolean
   selectedMessageIds: Set<string>
   stripTimePrefix: (text: string) => string
   renderMarkdown: (text: string) => string
@@ -301,13 +309,13 @@ const props = defineProps<{
   bottomPadding?: number
   /** Identity of the live/status slot, stable across stream updates. */
   trailingKey?: string
-}>()
+}>(), { messageEditingAvailable: true, regenerationAvailable: true, forkAvailable: true })
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
   editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
   previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
-  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[], preview?: import('@/composables/chat/useArtifactImageLightbox').AttachmentImagePreviewSource]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
@@ -338,16 +346,21 @@ const emit = defineEmits<{
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
 const MESSAGE_GAP_PX = 4
 const { t } = useI18n()
+const listInstanceId = useId()
+const turnAnchorPrefix = computed(() => `chat-turn-${encodeURIComponent(props.sessionKey || 'unbound')}-${listInstanceId}`)
+const messageAnchorId = (index: number) => `${turnAnchorPrefix.value}-${index}`
+const policy = useConversationPolicy()
 
 function forwardSystemRetry(
   message: ChatRenderedMessage,
   settle: (accepted: boolean) => void,
 ) {
+  if (!policy.value.retry || props.regenerationAvailable === false) { settle(false); return }
   emit('regenerateMessage', message, settle)
 }
 
 function sandboxResumeAvailable(message: ChatRenderedMessage): boolean {
-  return Boolean(props.sessionKey && props.sandboxResumeTurnId
+  return Boolean(policy.value.retry && props.sessionKey && props.sandboxResumeTurnId
     && !props.shareMode && !props.forkBusy && !props.isStreaming
     && sandboxResumeMessageTurnId(message) === props.sandboxResumeTurnId)
 }
@@ -408,7 +421,7 @@ function shouldShowTurnOutcome(index: number): boolean {
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
   return Boolean(
-    message
+    policy.value.retry && props.regenerationAvailable !== false && message
     && isUsageAccountingBarrierMessage(message)
     && strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
   )
@@ -439,7 +452,9 @@ let cancelledSeek = false
 let nativeSmoothSeek = false
 let liveEdgeSeek = false
 const layoutPending = ref(false)
+let restoringFlowLayout = false
 let readingTextAnchor: { key: string; anchor: TextScrollAnchor } | null = null
+let readingElementAnchor: { key: string; anchor: ElementScrollAnchor } | null = null
 let readingAnchor: VirtualizerAnchor | null = null
 let readingPosition = -1
 const activeNavigation = ref<{ key: string; options: ScrollToOptions } | null>(null)
@@ -753,10 +768,15 @@ function updateSizeAdjustmentPolicy(
   instance: Virtualizer<HTMLElement, HTMLElement>,
   repeatedObservation = false,
 ) {
+  // Fully mounted rows already reflow in native document order. Their DOM
+  // anchor owns a width change; estimate/size corrections must not race it.
+  const flowReflow = !virtualizationEnabled.value && (restoringFlowLayout || (
+    layoutWidth > 0 && Math.abs((listRootRef.value?.getBoundingClientRect().width ?? layoutWidth) - layoutWidth) > 0.5
+  ))
   // Core only caches an initial size when it differs from the estimate. A
   // repeated observation of the same DOM row is still a resize even when that
   // first size happened to equal its estimate. No sizes/keys are stored here.
-  instance.shouldAdjustScrollPositionOnItemSizeChange = scrollHandoff.value ? () => false : (
+  instance.shouldAdjustScrollPositionOnItemSizeChange = scrollHandoff.value || flowReflow ? () => false : (
     activeNavigation.value || layoutPending.value || repeatedObservation
   ) ? (item, _delta, current) => item.end <= (current.scrollOffset ?? 0) : undefined
 }
@@ -1086,6 +1106,7 @@ function cancelScroll() {
   layoutPending.value = false
   layoutAnchorKey.value = null
   readingTextAnchor = null
+  readingElementAnchor = null
   readingAnchor = null
   readingPosition = -1
   // Do not write the current scrollTop here: Chromium may already have applied
@@ -1176,7 +1197,7 @@ function rememberReadingAnchor() {
     || Math.abs(root.getBoundingClientRect().width - layoutWidth) > 0.5) return
   const offset = container.scrollTop
   const item = virtualizer.value.getVirtualItemForOffset(offset)
-  if (!item) { readingAnchor = null; return }
+  if (!item) { readingAnchor = null; readingElementAnchor = null; return }
   let anchor = item
   // A small leftover tail is not the reader's primary content. Anchor the
   // next complete row, while near-boundary and oversized-message reads keep
@@ -1188,6 +1209,9 @@ function rememberReadingAnchor() {
     )) ?? item
   }
   readingAnchor = { key: anchor.key, intraOffset: offset - anchor.start }
+  const elementAnchor = !virtualizationEnabled.value
+    ? captureElementScrollAnchor(container, messageRow(anchor.index)) : null
+  readingElementAnchor = elementAnchor ? { key: String(anchor.key), anchor: elementAnchor } : null
 }
 
 function captureReadingText() {
@@ -1231,6 +1255,40 @@ function preserveLayoutChange(applyLayoutChange?: () => void) {
       }
       layoutPending.value = false
     })
+    return
+  }
+  if (!virtualizationEnabled.value) {
+    // All rows exist: keep their actual position in this layout, without
+    // clearing sizes and seeking through estimated offsets across frames.
+    const instance = virtualizer.value
+    restoringFlowLayout = true
+    updateSizeAdjustmentPolicy(instance)
+    try {
+      applyLayoutChange?.()
+      // Refresh the mounted sizes while the DOM anchor owns scroll. Later RO
+      // notifications then see the same sizes instead of compensating twice.
+      if (!applyLayoutChange) {
+        const sizes = Array.from(listRootRef.value?.querySelectorAll<HTMLElement>(':scope > [data-index]') ?? [],
+          row => ({ index: Number(row.dataset.index), height: row.getBoundingClientRect().height }))
+        for (const row of sizes) instance.resizeItem(row.index, row.height)
+      }
+      if (props.followLiveEdge) instance.scrollToEnd()
+      else {
+        const anchor = readingElementAnchor
+        const row = anchor ? messageRow(messageKeys.value.indexOf(anchor.key)) : null
+        const restored = (textAnchor && restoreTextScrollAnchor(textAnchor.anchor, row))
+          || restoreElementScrollAnchor(anchor?.anchor ?? null, row)
+        if (restored) stopScrollReconciliation()
+      }
+      synchronizeScrollOffset?.()
+    } finally {
+      restoringFlowLayout = false
+      layoutPending.value = false
+      updateSizeAdjustmentPolicy(instance)
+      readingPosition = -1
+      rememberReadingAnchor()
+      captureReadingText()
+    }
     return
   }
   void remeasureVirtualizer(virtualizer.value, {
@@ -1292,6 +1350,7 @@ function syncPreference(event: StorageEvent) {
 }
 
 defineExpose<ChatMessageListVirtualizer>({
+  messageAnchorId,
   ensureMessageVisible,
   ensureMessageContentVisible,
   messageBodyText: index => props.messages[index] ? hydratedMessage(props.messages[index], index).text : '',

@@ -4,11 +4,11 @@
     ref="sidebarRef"
     class="sidebar"
     :class="{
-      docked: appStore.sidebarOpen,
+      docked: effectiveSidebarOpen,
       'sidebar--drawer': isSidebarDrawer,
     }"
-    :inert="!appStore.sidebarOpen"
-    :aria-hidden="appStore.sidebarOpen ? undefined : 'true'"
+    :inert="!effectiveSidebarOpen"
+    :aria-hidden="effectiveSidebarOpen ? undefined : 'true'"
     :aria-label="t('chrome.primaryNav')"
     id="sidebar-nav"
   >
@@ -23,7 +23,7 @@
         class="sidebar-dock-toggle"
         :aria-label="t('chrome.collapseSidebar')"
         aria-controls="sidebar-nav"
-        :aria-expanded="appStore.sidebarOpen"
+        :aria-expanded="effectiveSidebarOpen"
         :aria-keyshortcuts="sidebarToggleAriaShortcut"
         aria-describedby="sidebar-toggle-tip-expanded"
         data-testid="sidebar-toggle-expanded"
@@ -125,9 +125,9 @@
   </nav>
 
   <SidebarResizer
-    v-if="appStore.sidebarOpen && isSidebarResizable"
+    v-if="effectiveSidebarOpen && isSidebarResizable"
     ref="sidebarResizerRef"
-    :enabled="appStore.sidebarOpen && isSidebarResizable"
+    :enabled="effectiveSidebarOpen && isSidebarResizable"
     :width="sidebarEffectiveWidth"
     :min="SIDEBAR_MIN_WIDTH"
     :max="sidebarDynamicMaximum"
@@ -144,7 +144,7 @@
 
   <!-- Drawer scrim is driven by the same runtime mode as JS focus/Escape logic. -->
   <div
-    v-if="appStore.sidebarOpen && isSidebarDrawer"
+    v-if="effectiveSidebarOpen && isSidebarDrawer"
     class="sidebar-scrim"
     role="presentation"
     aria-hidden="true"
@@ -164,33 +164,34 @@
   <div
     id="app-main"
     class="main"
-    :inert="appStore.sidebarOpen && isSidebarDrawer"
+    :inert="effectiveSidebarOpen && isSidebarDrawer"
     :class="{
-      docked: appStore.sidebarOpen,
+      docked: effectiveSidebarOpen,
       'main--sidebar-drawer': isSidebarDrawer,
       'main--sidebar-compact': sidebarLayoutMode === 'compact',
       'main--chat': isChatRoute,
-      'main--chat-sidebar-collapsed': isChatRoute && !appStore.sidebarOpen,
+      'main--chat-sidebar-collapsed': isChatRoute && !effectiveSidebarOpen,
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <div class="app-workspace">
+    <div ref="workspaceRef" class="app-workspace" :data-workbench-layout="effectiveWorkbenchLayout">
       <div
-        v-show="!workbenchMaximized"
+        v-show="!mainPaneHidden"
         class="app-chat-pane"
-        :inert="workbenchMaximized || undefined"
-        :aria-hidden="workbenchMaximized ? 'true' : undefined"
+        :class="{ 'app-chat-pane--layout-motion': workbenchMotionEnabled }"
+        :inert="workbenchSinglePane || undefined"
+        :aria-hidden="workbenchSinglePane ? 'true' : undefined"
       >
     <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }" :data-connection-state="effectiveConnectionState">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
-          v-show="!appStore.sidebarOpen"
+          v-show="!effectiveSidebarOpen"
           ref="topbarSidebarToggleRef"
           class="sidebar-dock-toggle topbar-toggle"
           :aria-label="sidebarExpandLabel"
           aria-controls="sidebar-nav"
-          :aria-expanded="appStore.sidebarOpen"
+          :aria-expanded="effectiveSidebarOpen"
           :aria-keyshortcuts="sidebarToggleAriaShortcut"
           aria-describedby="sidebar-toggle-tip-collapsed"
           data-testid="sidebar-toggle-collapsed"
@@ -252,7 +253,9 @@
           @open-approval="openBlockedApprovalSession"
         />
         <WorkbenchToggle
+          v-if="!workbenchToggleInPanel"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+          :presentation-visible="false"
           allow-empty
           :session-id="workbenchSessionKey"
           :blocked="workbenchModalBlocked"
@@ -260,9 +263,9 @@
       </div>
     </header>
       <main
-        v-show="!workbenchMaximized"
-        :inert="workbenchMaximized || undefined"
-        :aria-hidden="workbenchMaximized ? 'true' : undefined"
+        v-show="!mainPaneHidden"
+        :inert="workbenchSinglePane || undefined"
+        :aria-hidden="workbenchSinglePane ? 'true' : undefined"
         class="content"
         :class="{ 'content--chat': isChatRoute }"
         id="content"
@@ -293,6 +296,11 @@
       </main>
       </div>
       <AppWorkbench
+        @return-chat="narrowWorkbenchRequested = false"
+        :available-width="workspaceAvailableWidth"
+        :layout-mode="effectiveWorkbenchLayout"
+        :motion-enabled="workbenchMotionEnabled"
+        :animate-layout="workbenchLayoutMotion"
         :enabled="appStore.features.artifactWorkbench === true"
         :workbench-resources-enabled="(
           appStore.features.documentWorkbenchResources === true
@@ -302,6 +310,16 @@
         :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
+        :session-loading="chatRouteHeader.model.sessionKey.value !== workbenchSessionKey
+          || chatRouteHeader.model.sessionLoading.value"
+        :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value"
+        :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionPreparable.value"
+        :conversation-started="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value && chatRouteHeader.model.visible.value
+          && chatRouteHeader.model.shareableMessageCount.value > 0"
+        :prepare-session="chatRouteHeader.prepareWorkbenchSession"
         :modal-blocked="workbenchModalBlocked"
         :workspace-id="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           ? chatRouteHeader.model.workspaceId.value : null"
@@ -309,7 +327,18 @@
           && chatRouteHeader.model.workspaceReady.value"
         :workspace-resolved="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           && chatRouteHeader.model.workspaceResolved.value"
-      />
+      >
+        <template #collapse-control>
+          <WorkbenchToggle
+            v-if="workbenchToggleInPanel"
+            :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+            :presentation-visible="true"
+            allow-empty
+            :session-id="workbenchSessionKey"
+            :blocked="workbenchModalBlocked"
+          />
+        </template>
+      </AppWorkbench>
       <ArtifactImageLightbox />
     </div>
   </div>
@@ -320,7 +349,7 @@
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
-    :inert="appStore.sidebarOpen && isSidebarDrawer"
+    :inert="effectiveSidebarOpen && isSidebarDrawer"
     :aria-label="t('chrome.primaryMobile')"
   >
     <router-link
@@ -353,7 +382,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
+    <ToastHost />
   </Teleport>
 
   <ConfirmModal />
@@ -445,6 +474,7 @@ import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
+import { WORKBENCH_SPLIT_MIN_WIDTH, workbenchLayoutMode, workbenchShouldYieldSidebar } from './workbench/layout'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
@@ -455,7 +485,7 @@ import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
   provideChatTopbarPopoverCoordinator,
 } from './composables/useChatTopbarPopoverCoordinator'
-import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import { provideArtifactImageLightbox, closeImageLightboxOutsideSession } from './composables/chat/useArtifactImageLightbox'
 import {
   provideChatRouteHeaderBridge,
   type ChatRouteHeaderHostHandle,
@@ -477,6 +507,7 @@ import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { provideSideChatLauncher } from '@/modules/sideChatLauncher'
 import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
@@ -539,14 +570,14 @@ const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentR
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
-const workbenchMaximized = computed(() => isChatRoute.value
-  && appStore.features.artifactWorkbench === true
-  && workbenchStore.expanded && workbenchStore.maximized)
+const workbenchVisible = computed(() => isChatRoute.value
+  && appStore.features.artifactWorkbench === true && workbenchStore.expanded)
 const topbarPopoverCoordinationEnabled = ref(true)
 provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
+provideSideChatLauncher()
 const {
   sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
@@ -578,6 +609,7 @@ type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
 const {
+  viewportWidth: shellWidth,
   mode: sidebarLayoutMode,
   dynamicMax: sidebarDynamicMaximum,
   effectiveWidth: sidebarEffectiveWidth,
@@ -585,6 +617,114 @@ const {
 const isSidebarDrawer = computed(() => sidebarLayoutMode.value === 'drawer')
 const isSidebarResizable = computed(() => sidebarLayoutMode.value === 'resizable')
 const sidebarResizeActive = ref(false)
+const workspaceRef = ref<HTMLElement | null>(null)
+const measuredWorkspaceWidth = ref(0)
+const sidebarRevealOverride = ref(false)
+// Opening a phone drawer is temporary. Window resizing must not rewrite the
+// user's desktop dock preference or unexpectedly open a drawer over the chat.
+const sidebarDrawerOpen = ref(false)
+const sidebarYieldsToWorkbench = computed(() => workbenchShouldYieldSidebar({
+  shellWidth: shellWidth.value,
+  sidebarWidth: sidebarEffectiveWidth.value + 1,
+  workbenchExpanded: workbenchVisible.value,
+  sidebarDrawer: isSidebarDrawer.value,
+}))
+const effectiveSidebarOpen = computed(() => isSidebarDrawer.value
+  ? sidebarDrawerOpen.value
+  : appStore.sidebarOpen && (!sidebarYieldsToWorkbench.value || sidebarRevealOverride.value))
+const workspaceAvailableWidth = computed(() => measuredWorkspaceWidth.value > 0
+  ? measuredWorkspaceWidth.value
+  : Math.max(0, shellWidth.value - (effectiveSidebarOpen.value && !isSidebarDrawer.value ? sidebarEffectiveWidth.value : 0)))
+// Responsive hiding is presentation only. Do not close a child or overwrite
+// the user's expanded/width preference when the primary conversation needs space.
+const narrowWorkbenchRequested = ref(false)
+const workbenchConstrained = computed(() => workspaceAvailableWidth.value < WORKBENCH_SPLIT_MIN_WIDTH)
+watch(workbenchConstrained, () => { narrowWorkbenchRequested.value = false }, { flush: 'sync' })
+watch(() => workbenchStore.revealRequestId, () => {
+  if (workbenchConstrained.value) narrowWorkbenchRequested.value = true
+}, { flush: 'sync' })
+watch(() => workbenchStore.activeSessionId, () => { narrowWorkbenchRequested.value = false })
+watch(() => workbenchStore.expanded, expanded => {
+  if (!expanded) narrowWorkbenchRequested.value = false
+}, { flush: 'sync' })
+const effectiveWorkbenchLayout = computed(() => workbenchLayoutMode({
+  availableWidth: workspaceAvailableWidth.value,
+  maximized: workbenchStore.maximized,
+  explicitReveal: narrowWorkbenchRequested.value,
+}))
+const workbenchSinglePane = computed(() => workbenchVisible.value
+  && effectiveWorkbenchLayout.value === 'single-pane')
+// The pane owns its collapse affordance. When responsive layout yields back to
+// the conversation, its expand affordance returns to the main header instead.
+const workbenchToggleInPanel = computed(() => workbenchVisible.value
+  && effectiveWorkbenchLayout.value !== 'main-only')
+watch(workbenchToggleInPanel, () => {
+  if (!(document.activeElement instanceof HTMLElement)
+    || !document.activeElement.matches('[data-testid="topbar-workbench-toggle"]')) return
+  void nextTick(() => workspaceRef.value?.querySelector<HTMLElement>(
+    '[data-testid="topbar-workbench-toggle"]',
+  )?.focus({ preventScroll: true }))
+})
+const workbenchMotionEnabled = ref(false)
+const workbenchLayoutMotion = ref(false)
+const mainPaneHidden = computed(() => workbenchSinglePane.value && !workbenchLayoutMotion.value)
+let workbenchMotionTimer: ReturnType<typeof setTimeout> | undefined
+let workspaceObserver: ResizeObserver | undefined
+function measureWorkspace() {
+  const width = workspaceRef.value?.getBoundingClientRect().width
+  if (width && Number.isFinite(width)) measuredWorkspaceWidth.value = width
+}
+function stopWorkbenchMotion() {
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = false
+  workbenchLayoutMotion.value = false
+}
+function onWorkspaceViewportResize() {
+  stopWorkbenchMotion()
+  measureWorkspace()
+}
+watch(workbenchVisible, visible => {
+  workbenchLayoutMotion.value = false
+  if (!visible) sidebarRevealOverride.value = false
+  if (sidebarResizeActive.value) return
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = true
+  workbenchMotionTimer = setTimeout(stopWorkbenchMotion, 240)
+}, { flush: 'sync' })
+watch(() => workbenchStore.maximized, () => {
+  if (!workbenchVisible.value || sidebarResizeActive.value) return
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = true
+  workbenchLayoutMotion.value = true
+  workbenchMotionTimer = setTimeout(stopWorkbenchMotion, 240)
+}, { flush: 'sync' })
+watch(effectiveSidebarOpen, (open, previous) => {
+  if (open || !previous) return
+  const focused = document.activeElement
+  const focusWasInSidebar = Boolean(focused && sidebarRef.value?.contains(focused))
+    || focused instanceof HTMLElement && focused.matches('.sidebar-resizer')
+  if (!focusWasInSidebar) return
+  void nextTick(() => {
+    const target = workbenchSinglePane.value
+      ? workspaceRef.value?.querySelector<HTMLElement>('[data-testid="workbench-return-chat"]')
+      : topbarSidebarToggleRef.value
+    target?.focus({ preventScroll: true })
+  })
+})
+watch([effectiveSidebarOpen, sidebarEffectiveWidth], () => void nextTick(measureWorkspace))
+onMounted(() => {
+  measureWorkspace()
+  if (typeof ResizeObserver !== 'undefined' && workspaceRef.value) {
+    workspaceObserver = new ResizeObserver(measureWorkspace)
+    workspaceObserver.observe(workspaceRef.value)
+  }
+  window.addEventListener('resize', onWorkspaceViewportResize, { passive: true })
+})
+onUnmounted(() => {
+  workspaceObserver?.disconnect()
+  window.removeEventListener('resize', onWorkspaceViewportResize)
+  clearTimeout(workbenchMotionTimer)
+})
 
 function setSidebarCssWidth(width: number) {
   if (!Number.isFinite(width)) return
@@ -826,13 +966,10 @@ watch(
   [
     currentSessionKey,
     isChatRoute,
-    () => artifactImageLightbox.request.value?.sessionKey || '',
+    () => artifactImageLightbox.request.value?.ownerSessionKey || artifactImageLightbox.request.value?.sessionKey || '',
   ],
   ([sessionKey, chatRouteActive]) => {
-    const request = artifactImageLightbox.request.value
-    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
-      artifactImageLightbox.close()
-    }
+    closeImageLightboxOutsideSession(artifactImageLightbox, sessionKey, chatRouteActive)
   },
   { flush: 'sync' },
 )
@@ -845,7 +982,7 @@ const settingsOverlayOpen = computed(() =>
 const workbenchModalBlocked = computed(() =>
   commandPaletteOpen.value
   || settingsOverlayOpen.value
-  || (appStore.sidebarOpen && isSidebarDrawer.value))
+  || (effectiveSidebarOpen.value && isSidebarDrawer.value))
 
 const contractDebugEnabled = computed(() => appStore.features.contractDebug === true)
 
@@ -859,7 +996,7 @@ const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
 const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
 const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
 const isMobileMoreActive = computed(() =>
-  appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
+  effectiveSidebarOpen.value || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
   if (path === '/skills') return isSkillsChannelsHubActive.value
@@ -1168,13 +1305,20 @@ type SidebarToggleSource = 'sidebar-button' | 'topbar-button' | 'shortcut'
 
 function toggleDock(source: SidebarToggleSource) {
   sidebarResizerRef.value?.cancel()
-  const wasOpen = appStore.sidebarOpen
+  const wasOpen = effectiveSidebarOpen.value
   const focusWasInsideSidebar = Boolean(
     sidebarRef.value && document.activeElement && sidebarRef.value.contains(document.activeElement),
   )
   const focusWasOnResizer = document.activeElement instanceof HTMLElement
     && document.activeElement.matches('.sidebar-resizer')
-  appStore.toggleSidebar()
+  // An explicit reveal wins over the temporary space-saving presentation.
+  // This override lasts only while the workbench is open; it is not a preference.
+  if (isSidebarDrawer.value) {
+    sidebarDrawerOpen.value = !wasOpen
+  } else {
+    sidebarRevealOverride.value = !wasOpen && sidebarYieldsToWorkbench.value
+    appStore.setSidebarOpen(!wasOpen)
+  }
   if (!wasOpen && (source === 'topbar-button' || isSidebarDrawer.value)) {
     void nextTick(() => sidebarDockToggleRef.value?.focus())
   } else if (wasOpen && (source === 'sidebar-button' || focusWasInsideSidebar || focusWasOnResizer)) {
@@ -1183,24 +1327,25 @@ function toggleDock(source: SidebarToggleSource) {
 }
 
 function handleNavClick() {
-  if (isSidebarDrawer.value && appStore.sidebarOpen) {
+  if (isSidebarDrawer.value && effectiveSidebarOpen.value) {
     closeSidebarDrawer()
   }
 }
 
 function openSidebarDrawer() {
-  if (appStore.sidebarOpen) return
+  if (!isSidebarDrawer.value || effectiveSidebarOpen.value) return
   toggleDock('topbar-button')
 }
 
 function closeSidebarDrawer() {
-  if (!appStore.sidebarOpen || !isSidebarDrawer.value) return
+  if (!effectiveSidebarOpen.value || !isSidebarDrawer.value) return
   sidebarResizerRef.value?.cancel()
-  appStore.setSidebarOpen(false)
+  sidebarDrawerOpen.value = false
   void nextTick(() => topbarSidebarToggleRef.value?.focus())
 }
 
 function handleSidebarResizeStart() {
+  stopWorkbenchMotion()
   sidebarResizeActive.value = true
 }
 
@@ -1234,9 +1379,9 @@ function handleSidebarResizeEnd() {
   setSidebarCssWidth(sidebarEffectiveWidth.value)
 }
 
-// Layout mode is a single state machine shared with Settings. Entering a drawer
-// force-closes the persistent dock; returning to desktop intentionally leaves it
-// closed until the user reopens it. Compact mode keeps the current open state.
+// Layout mode is a single state machine shared with Settings. Each transition
+// starts with a closed drawer; returning to desktop restores the dock preference.
+// Compact mode keeps the current desktop preference as well.
 watch(sidebarLayoutMode, (nextMode, previousMode) => {
   const focusWasOnResizer = document.activeElement instanceof HTMLElement
     && document.activeElement.matches('.sidebar-resizer')
@@ -1244,11 +1389,11 @@ watch(sidebarLayoutMode, (nextMode, previousMode) => {
   sidebarResizeActive.value = false
   setSidebarCssWidth(sidebarEffectiveWidth.value)
 
-  if (nextMode === 'drawer' && appStore.sidebarOpen) {
+  sidebarDrawerOpen.value = false
+  if (nextMode === 'drawer') {
     const focusWasInsideSidebar = Boolean(
       sidebarRef.value && document.activeElement && sidebarRef.value.contains(document.activeElement),
     )
-    appStore.setSidebarOpen(false)
     if (focusWasOnResizer || focusWasInsideSidebar) {
       void nextTick(() => topbarSidebarToggleRef.value?.focus())
     }
@@ -1836,7 +1981,7 @@ function handleKeydown(e: KeyboardEvent) {
   // collapse as a side effect of an Escape meant for an overlay opened on top of
   // it. The shared dialog-layer guard above handles that ordering collision;
   // this branch remains mobile-only because desktop uses a persistent dock.
-  if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
+  if (e.key === 'Escape' && effectiveSidebarOpen.value && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }
 }
@@ -2016,6 +2161,8 @@ onUnmounted(() => {
   min-height: 0;
   flex: 1;
 }
+
+.app-chat-pane--layout-motion { overflow: hidden; }
 
 .app-chat-pane {
   position: relative;

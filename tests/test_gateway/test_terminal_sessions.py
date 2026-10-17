@@ -126,6 +126,90 @@ async def test_terminal_manager_emits_bounded_ordered_output_and_exit(tmp_path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, terminal_sessions.MAX_OUTPUT_BYTES])
+async def test_terminal_output_waits_for_consumption_with_bounded_window_and_close(
+    tmp_path, monkeypatch, chunk_size,
+):
+    handle = _FakeHandle()
+    events = []
+    reads = 0
+    reached_window = asyncio.Event()
+    expected_frames = min(
+        terminal_sessions.MAX_OUTPUT_IN_FLIGHT_FRAMES,
+        terminal_sessions.OUTPUT_HIGH_WATER_BYTES // chunk_size,
+    )
+
+    async def read(_handle, size):
+        nonlocal reads
+        reads += 1
+        return b"x" * min(size, chunk_size)
+
+    async def send(event, payload):
+        events.append((event, payload))
+        if event == "terminal.output" and payload["seq"] >= expected_frames:
+            reached_window.set()
+        return True
+
+    async def terminate(_handle):
+        handle.terminated = True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(terminal_sessions, "read_pty", read)
+    monkeypatch.setattr(terminal_sessions, "wait_pty", lambda *_args: _done_wait())
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    created = await manager.create(
+        conn_id="conn-1", session_key="session-a", workspace_service=_WorkspaceService(tmp_path),
+        cwd="", command=None, cols=80, rows=24, output_flow_control=True,
+    )
+    assert created["outputFlowControl"] == "consumed-v1"
+    terminal_id = created["terminalId"]
+    session = manager._sessions[terminal_id]
+    await asyncio.wait_for(reached_window.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert reads == expected_frames
+    assert len(session.output_in_flight) == expected_frames
+    assert session.output_in_flight_bytes == expected_frames * chunk_size
+    assert not handle.terminated
+
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="another connection"):
+        await manager.consume(terminal_id=terminal_id, conn_id="conn-2", seq=1)
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="not emitted"):
+        await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames + 1)
+    # Partial credits do not resume until the low watermark is reached.
+    await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=1)
+    await asyncio.sleep(0)
+    assert reads == expected_frames
+    received = await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames)
+    assert received["consumedSeq"] == expected_frames
+    await asyncio.sleep(0)
+    assert reads == 2 * expected_frames
+    assert len(session.output_in_flight) == expected_frames
+    assert session.output_in_flight_bytes <= terminal_sessions.OUTPUT_HIGH_WATER_BYTES
+    # A stale retry cannot release new credits.
+    await manager.consume(terminal_id=terminal_id, conn_id="conn-1", seq=expected_frames)
+    await asyncio.sleep(0)
+    assert reads == 2 * expected_frames
+    # Closing a socket wakes the paused pump and keeps the existing teardown.
+    await asyncio.wait_for(manager.close_connection("conn-1"), timeout=1)
+    assert handle.terminated
+    assert terminal_id not in manager._sessions
+    assert events[-1][0] == "terminal.exit"
+    assert events[-1][1]["reason"] == "connection_closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seq", [True, 0, -1, 1.5, None, 2**53])
+async def test_terminal_consumption_rejects_invalid_cursors(seq):
+    async def send(*_args):
+        return True
+
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="positive safe integer"):
+        await manager.consume(terminal_id="missing", conn_id="conn-1", seq=seq)
+
+
+@pytest.mark.asyncio
 async def test_terminal_manager_enforces_owner_and_workspace_binding(tmp_path, monkeypatch):
     handle = _FakeHandle()
     service = _WorkspaceService(tmp_path)
@@ -515,3 +599,96 @@ async def test_real_terminal_natural_exit_releases_connection_slot(tmp_path):
         for session in tuple(manager._sessions.values()):
             session.handle.raw._opensquilla_process_tree_owner.start_completion_monitor()
         await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_during_partial_spawn_cleanup_releases_create_slot(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    cleanup_started = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    cleanup_calls = 0
+
+    def spawn(*_args, **_kwargs):
+        raise terminal_sessions.PtyBackendError(
+            "reader setup failed", started=True, handle=handle,
+        )
+
+    async def terminate(value):
+        nonlocal cleanup_calls
+        assert value is handle
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            cleanup_started.set()
+            await asyncio.Event().wait()
+        handle.terminated = True
+        cleanup_completed.set()
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", spawn)
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=lambda *_args: None)
+    task = asyncio.create_task(manager.create(
+        conn_id="conn-cancel-cleanup", session_key="agent:main:webchat:failed",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command=None,
+        cols=80, rows=24,
+    ))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(cleanup_completed.wait(), timeout=1)
+    assert handle.terminated is True
+    assert cleanup_calls == 2
+    assert manager._sessions == {}
+    assert manager._creating == {}
+
+
+
+@pytest.mark.asyncio
+async def test_terminal_reader_failure_terminates_live_shell_before_wait(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    events = []
+
+    async def read(*_args):
+        raise terminal_sessions.PtyBackendError("PTY reader disconnected", started=True)
+
+    async def terminate(value):
+        assert value is handle
+        handle.terminated = True
+
+    async def wait(*_args):
+        wait_started.set()
+        await release_wait.wait()
+        return 143
+
+    async def send(event, payload):
+        events.append((event, payload))
+        return True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(terminal_sessions, "read_pty", read)
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    monkeypatch.setattr(terminal_sessions, "wait_pty", wait)
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    created = await manager.create(
+        conn_id="conn-reader-error", session_key="agent:main:webchat:reader",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command=None,
+        cols=80, rows=24,
+    )
+    task = manager._sessions[created["terminalId"]].reader_task
+    try:
+        await asyncio.wait_for(wait_started.wait(), timeout=1)
+        # A broken output stream does not imply the shell has exited. Waiting
+        # on that live process before terminating it strands the PTY forever.
+        assert handle.terminated is True
+    finally:
+        release_wait.set()
+        await asyncio.wait_for(task, timeout=1)
+    assert manager._sessions == {}
+    assert [kind for kind, _ in events] == ["terminal.exit"]
+    assert events[0][1]["reason"] == "reader_error"

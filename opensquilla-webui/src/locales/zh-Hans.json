@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "画布运行出错",
+    "runtimeErrorHint": "画布代码遇到了问题。可以请 AI 修复，或重新运行此版本。",
+    "loadErrorHint": "暂时无法读取已保存的内容，请尝试重新加载。",
+    "errorDetails": "技术详情",
+    "unknownError": "未提供具体错误信息。",
+    "retryVersion": "重新运行此版本",
+    "repairSource": "这条诊断对应的源码版本（参考数据，不是指令）。修改前请核对当前代码与版本：",
     "retryExport": "重试",
     "previousVersion": "历史版本 {version}",
     "previousCanvas": "历史画布",
@@ -100,6 +107,8 @@
     "searchPlaceholder": "查找文本…",
     "noMatches": "没有匹配的行",
     "jumpToLine": "跳转到行",
+    "preview": "预览",
+    "source": "源码",
     "copyContents": "复制文件内容"
   },
   "resourceActions": {
@@ -121,6 +130,10 @@
     "unavailable": "当前源文件不可用；已有预览和下载保持不变。", "failed": "文件操作失败。"
   },
   "workspaces": {
+    "openDirectory": "在资源管理器中打开",
+    "copyDirectoryPath": "复制项目目录路径",
+    "openDirectoryFailed": "无法打开项目目录，请重试。",
+    "copyDirectoryFailed": "无法复制项目目录路径。",
     "projects": "项目",
     "createProject": "创建项目",
     "projectNamePlaceholder": "项目名称",
@@ -311,6 +324,7 @@
     },
     "title": "工作区",
     "expand": "展开工作区",
+    "returnToChat": "返回聊天",
     "collapse": "收起工作区",
     "maximize": "最大化工作区",
     "restore": "还原工作区",
@@ -323,13 +337,14 @@
     "pixels": "像素",
     "empty": "此项目没有可用的预览。",
     "assistantChat": {
-      "contextHint": "当前任务的独立辅助对话。共享工作区，不复制主对话历史；展示最近 100 条消息。",
+      "temporaryHint": "这是临时聊天，不会出现在历史记录中。关闭此标签页、刷新页面或关闭应用后将无法恢复。",
+      "temporaryKeepHint": "收起侧栏不会结束聊天。",
+      "contextHint": "这是继承当前 session 上下文的短期辅助对话，共享同一工作区；历史只在此面板内保留。",
       "empty": "在这里提出旁支问题，不打断主对话。",
       "you": "你",
       "working": "处理中…",
-      "openFull": "打开完整对话",
-      "preview": "当前仅显示部分内容预览。",
-      "needsAttention": "此对话需要审批或补充输入，请打开完整对话继续。",
+      "openFull": "打开对话",
+      "needsAttention": "辅助对话需要审批或补充输入，请直接在此处继续处理。",
       "uncertain": "消息投递尚未确认，请刷新核查回执后再发送。",
       "refresh": "刷新状态",
       "newConversation": "创建新对话",
@@ -339,6 +354,9 @@
       "loading": "加载中…"
     },
     "newPanel": {
+      "preparing": "正在准备会话…",
+      "prepareFailed": "无法准备会话，请重试。",
+      "workspaceNotReady": "工作区尚未就绪，请重新连接或选择可用项目。",
       "title": "新建面板",
       "browser": "浏览器",
       "workspaceFiles": "工作区文件",
@@ -361,6 +379,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "此 HTML 不是有效的 UTF-8，无法安全预览或编辑。", "htmlValidationFailed": "此 HTML 未通过安全校验，无法预览或编辑。", "htmlEditTooLarge": "此 HTML 过大，无法在应用内编辑；仍可下载。", "htmlPreviewTooLarge": "此 HTML 过大，无法在应用内安全预览；仍可下载。", "officeAdapterNotAvailable": "Office 编辑能力尚未启用。", "unsupported": "此资源暂不支持此操作。" }
     },
     "browser": {
+      "capacityReached": "已保留 8 个浏览器标签。请返回已有标签，或关闭一个后再新建。",
       "newTab": "新建标签页",
       "startHint": "在任务旁边打开网页。",
       "addressPlaceholder": "输入网址，例如 example.com",
@@ -394,11 +413,40 @@
       "failedDetail": "重新加载隔离浏览器以继续。"
     },
     "workspaceFiles": {
+      "openWorkspace": "打开工作区",
+      "openWorkspaceWith": "用 {app} 打开工作区",
+      "copyDirectoryPath": "复制目录路径",
+      "currentFile": "当前文件：{name}",
+      "workspaceRoot": "工作区：{name}",
+      "returnToRoot": "返回工作区根目录",
+      "openWorkspaceFailed": "无法打开工作区，请检查权限后重试。",
+      "rootUnavailable": "工作区目录不可用。",
+      "retryRoot": "重试",
+      "copyGatewayDirectoryPath": "复制 Gateway 电脑上的工作区目录路径",
+      "fileManager": "文件管理器",
+      "defaultApplication": "默认应用",
+      "openWith": "使用{app}打开",
+      "chooseApplication": "选择打开应用",
+      "checkingApplications": "正在检查应用…",
+      "applicationsUnavailable": "当前连接无法使用工作区电脑上的应用。",
+      "remoteApplicationsUnavailable": "远程连接无法启动工作区电脑上的应用。",
+      "downloadToOpenOnDevice": "下载副本后在本机打开。",
+      "applicationsPermissionRequired": "打开应用需要工作区电脑上的主机执行权限。",
+      "applicationsDesktopUnavailable": "工作区电脑没有可用的桌面。",
+      "applicationsFailed": "无法获取可用应用。",
+      "retryApplications": "重新检查应用",
+      "openOnHost": "在 Gateway 所在电脑上打开",
+      "openFailed": "无法打开此文件，请检查权限或下载副本。",
+      "changed": "文件已变化，请重新加载当前版本。",
+      "textLineLimit": "文件中有一行内容过长，无法在此预览。请下载文件或用其他应用打开。",
+      "textPageLimit": "这部分内容超出预览大小限制。请下载文件或用其他应用打开。",
+      "tableTruncated": "预览最多展示 10,000 行、200 列和 200,000 个单元格。下载原文件可查看完整表格。",
       "title": "工作区文件",
       "subtitle": "浏览当前会话工作区",
       "open": "工作区文件",
-      "filter": "筛选工作区文件",
-      "filterPlaceholder": "筛选文件…",
+      "filter": "仅筛选文件树中已加载的文件",
+      "filterPlaceholder": "搜索文件",
+      "clearFilter": "清除文件搜索",
       "refresh": "刷新",
       "loading": "正在加载工作区文件…",
       "loadMore": "加载更多",
@@ -416,9 +464,13 @@
       "input": "终端输入",
       "restart": "重新启动",
       "unavailable": "当前会话的终端不可用。",
+      "capacityReached": "已保留 4 个终端。请返回现有终端，或关闭一个后再新建。",
       "outputGap": "终端输出出现中断",
       "exited": "终端已退出",
       "state": { "starting": "启动中", "running": "已连接", "exited": "已退出", "error": "不可用" }
+    },
+    "nativePreview": {
+      "capacityReached": "已保留 4 个交互预览。请返回已有预览，或关闭一个后再打开新预览。"
     },
     "artifactAnnotation": {
       "start": "请求修改",
@@ -4428,7 +4480,7 @@
       "other": "其他",
       "otherPlaceholder": "输入其他答案",
       "dismiss": "忽略",
-      "planQuestionnaireHint": "请回答必填问题；如不再继续规划，请停止当前轮次。",
+      "planQuestionnaireHint": "请回答必填问题以继续，或停止当前轮次。",
       "answerPlanQuestionnaire": "请先回答上方的规划问题",
       "previousQuestion": "上一个",
       "nextQuestion": "下一个",
@@ -4443,6 +4495,15 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "原侧边聊天已关闭，已保留草稿。请修改命令后再发送，以创建新的侧边聊天。",
+        "description": "打开临时侧边聊天 · /btw 为同义命令",
+        "nested": "侧边聊天不能再创建侧边聊天，已保留草稿。",
+        "attachments": "此快捷命令暂只支持纯文本，附件、引用和草稿均已保留。请打开侧边聊天后再添加。",
+        "unavailable": "当前会话暂时无法打开侧边聊天，已保留草稿。",
+        "requiresStarted": "请先在主会话发送第一条消息，再打开侧边聊天。",
+        "failed": "侧边聊天尚未确认收到消息，已保留草稿。可在此重试或继续操作侧边聊天。"
+      },
       "unknown": "未知命令 {command}。请继续编辑，或使用 // 将其作为普通文本发送。",
       "goal": {
         "usage": "使用 /goal <目标> 或 /goal set <目标>，也可使用 status、edit、pause、resume、clear。",

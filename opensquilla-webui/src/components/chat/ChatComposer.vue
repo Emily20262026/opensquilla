@@ -176,10 +176,10 @@
             :placeholder="placeholder"
             :disabled="inputDisabled"
             :aria-label="t('chat.messageToSend')"
-            :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
-            :aria-controls="paletteOpen ? 'chat-slash-options' : undefined"
+            :aria-describedby="sendControlHint ? sendTooltipId : undefined"
+            :aria-controls="paletteOpen ? paletteId || 'chat-slash-options' : undefined"
             :aria-expanded="paletteOpen"
-            :aria-activedescendant="paletteOpen ? `chat-slash-option-${paletteActiveIndex}` : undefined"
+            :aria-activedescendant="paletteOpen ? `${paletteId || 'chat-slash'}-option-${paletteActiveIndex}` : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
@@ -191,7 +191,7 @@
           />
         </div>
         <div class="chat-collapse-region chat-collapse-region--footer">
-          <div class="chat-input-footer">
+          <div ref="toolbarEl" class="chat-input-footer">
           <div class="chat-input-actions chat-input-actions--left">
             <div ref="addMenuAnchorEl" class="chat-settings-anchor chat-add-menu-anchor">
               <button
@@ -218,11 +218,11 @@
                 :local-paths-available="localPathsAvailable"
                 :local-paths-disabled="replanActive || inputDisabled || localPathsBusy"
                 :goal-mode-active="goalDraftArmed"
-                :goal-mode-available="goalModeAvailable === true"
+                :goal-mode-available="policy.goal && goalModeAvailable === true"
                 :goal-mode-busy="goalModeBusy === true"
                 :goal-mode-existing="goalModeExisting === true"
                 :plan-mode-active="collaborationMode === 'plan'"
-                :plan-mode-available="planModeAvailable === true"
+                :plan-mode-available="policy.plan && planModeAvailable === true"
                 :plan-mode-busy="planModeBusy === true || planModeDisabled === true"
                 :show-utility-actions="true"
                 :voice-busy="voiceBusy"
@@ -231,8 +231,8 @@
                 :prompt-cache-keepalive-available="promptCacheKeepaliveAvailable"
                 :prompt-cache-keepalive-session-ready="promptCacheKeepaliveSessionReady"
                 :prompt-cache-keepalive-status="promptCacheKeepaliveStatus"
-                @activate-goal-mode="emit('armGoal')"
-                @activate-plan-mode="emit('setCollaborationMode', 'plan')"
+                @activate-goal-mode="policy.goal && emit('armGoal')"
+                @activate-plan-mode="policy.plan && emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
                 @select-browser-use="emit('selectBrowserUse')"
                 @choose-skill="chooseMenuSkill"
@@ -278,6 +278,7 @@
               type="button"
               class="chat-project-choose"
               :aria-label="t('workspaces.chooseProject')"
+              :title="t('workspaces.chooseProject')"
               :disabled="projectBindingBusy"
               @click="emit('chooseProject')"
             >
@@ -298,7 +299,7 @@
                 aria-haspopup="dialog"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
                 :aria-disabled="runModeLocked ? 'true' : 'false'"
-                :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
+                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
                 :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
@@ -307,7 +308,7 @@
               </button>
               <span
                 v-if="runModeLocked"
-                id="chat-run-mode-lock-tip"
+                :id="runModeLockTooltipId"
                 class="chat-run-mode-lock-tip"
                 role="tooltip"
               >{{ runModeLockMessage }}</span>
@@ -321,10 +322,12 @@
               />
             </div>
             <ChatComposerGoalMode
+              v-if="policy.goal"
               :active="goalDraftArmed"
               @disarm="emit('disarmGoal')"
             />
             <ChatComposerPlanMode
+              v-if="policy.plan"
               :available="planModeAvailable === true"
               :mode="collaborationMode || 'default'"
               :busy="planModeBusy === true"
@@ -354,10 +357,10 @@
               >
                 <Icon v-if="sessionRoutingMode === 'squilla_router'" name="router" :size="17" />
                 <Icon v-else-if="sessionRoutingMode === 'llm_ensemble'" name="fork" :size="17" />
-                <span v-else class="chat-model-routing-btn__dot" aria-hidden="true" />
+                <Icon v-else name="agents" :size="17" aria-hidden="true" />
                 <span class="chat-model-routing-btn__label">{{ modelRoutingTriggerLabel }}</span>
                 <span v-if="modelRoutingUsesDefault" class="chat-model-routing-btn__default">{{ t('chat.newTaskModel.defaultBadge') }}</span>
-                <Icon name="chevronDown" :size="12" />
+                <Icon class="chat-model-routing-btn__chevron" name="chevronDown" :size="12" />
                 <span
                   v-if="showRouterNewBadge"
                   class="chat-model-routing-btn__new"
@@ -406,7 +409,7 @@
               :tabindex="sendControlHint ? 0 : undefined"
               :role="sendControlHint ? 'group' : undefined"
               :aria-label="sendControlHint ? t('chat.send') : undefined"
-              :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+              :aria-describedby="sendControlHint ? sendTooltipId : undefined"
               @mouseenter="sendHintDismissed = false"
               @focusin="sendHintDismissed = false"
               @pointerdown="focusSendHint"
@@ -436,7 +439,7 @@
                 :title="sendBlockedMessage || sendPending || sendDisabled || sessionRoutingBusy || inputDisabled ? undefined
                   : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-                :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+                :aria-describedby="sendControlHint ? sendTooltipId : undefined"
                 :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
                 :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
@@ -446,7 +449,7 @@
               </button>
               <span
                 v-if="sendControlHint"
-                id="chat-composer-send-tooltip"
+                :id="sendTooltipId"
                 class="chat-send-tooltip"
                 role="tooltip"
               >{{ sendControlHint }}</span>
@@ -468,10 +471,12 @@
 </template>
 
 <script setup lang="ts">
+import { useConversationPolicy } from '@/modules/conversationPolicy'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useComposerToolbarFit } from '@/composables/chat/useComposerToolbarFit'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
@@ -520,6 +525,7 @@ const props = withDefaults(defineProps<{
   skillsLoading?: boolean
   skillsError?: string
   paletteOpen?: boolean
+  paletteId?: string
   paletteActiveIndex?: number
   attachments: Attachment[]
   localPaths?: readonly string[]
@@ -653,6 +659,10 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const composerId = useId()
+const sendTooltipId = `chat-composer-send-tooltip-${composerId}`
+const runModeLockTooltipId = `chat-run-mode-lock-tip-${composerId}`
+const policy = useConversationPolicy()
 const runModeLabel = computed(() => t(
   props.runMode === 'full' ? 'chat.composer.runModeFull' : 'chat.composer.runModeSafe',
 ))
@@ -710,6 +720,8 @@ const inputText = defineModel<string>({ required: true })
 watch([sendControlHint, inputText], () => { sendHintRequested.value = false })
 const composerEl = ref<HTMLElement | null>(null)
 const inputPanelEl = ref<HTMLElement | null>(null)
+const toolbarEl = ref<HTMLElement | null>(null)
+useComposerToolbarFit(toolbarEl, inputPanelEl)
 const inlineEditor = ref<InstanceType<typeof ChatInlineEditor> | null>(null)
 const textareaEl = computed(() => inlineEditor.value?.element() ?? null)
 function onTextareaInput(event: Event) {
@@ -826,15 +838,68 @@ function closeOpenPopoversFromOutside(event: PointerEvent) {
   }
 }
 
+let popoverOwnerObserver: MutationObserver | null = null
+
+function hiddenPopoverAncestor(element: HTMLElement | null): HTMLElement | null {
+  for (let current = element; current; current = current.parentElement) {
+    if (current.hasAttribute('inert') || current.hidden
+      || current.getAttribute('aria-hidden') === 'true'
+      || current.style.display === 'none') return current
+  }
+  return null
+}
+
+function closePopoversForHiddenOwner() {
+  const hiddenOwner = hiddenPopoverAncestor(composerEl.value)
+  if (!hiddenOwner || !anyPopoverOpen.value) return
+  const focused = document.activeElement
+  // Routing is teleported outside the pane; the host's normal focus-return
+  // cannot detect that its menu still owns focus after the pane becomes inert.
+  const transferFocus = focused instanceof HTMLElement && (
+    hiddenOwner.contains(focused)
+    || modelRoutingPanelRef.value?.element()?.contains(focused)
+  )
+  closeAllPopovers()
+  if (!transferFocus) return
+  void nextTick(() => {
+    const current = document.activeElement
+    // Respect a host/dialog that already moved focus to a visible control.
+    if (current !== focused && current !== document.body && current?.isConnected) return
+    const candidates = document.querySelectorAll<HTMLElement>([
+      '[data-testid="workbench-return-chat"]',
+      '[data-testid="topbar-workbench-toggle"]',
+      '[data-testid="chat-session-action-workbench"]',
+      '.chat-inline-editor',
+    ].join(','))
+    const target = [...candidates].find(element => !hiddenPopoverAncestor(element)
+      && element.getClientRects().length > 0 && !element.matches(':disabled'))
+    target?.focus({ preventScroll: true })
+  })
+}
+
 watch(anyPopoverOpen, (open) => {
+  popoverOwnerObserver?.disconnect()
+  popoverOwnerObserver = null
   if (open) {
     document.addEventListener('pointerdown', closeOpenPopoversFromOutside, true)
+    // Observe only the owning ancestor chain, and only while a menu is open.
+    // Main and side panes stay mounted when hidden, so unmount hooks alone do
+    // not close their inline or teleported menus.
+    popoverOwnerObserver = new MutationObserver(closePopoversForHiddenOwner)
+    for (let owner = composerEl.value; owner; owner = owner.parentElement) {
+      popoverOwnerObserver.observe(owner, {
+        attributes: true,
+        attributeFilter: ['inert', 'hidden', 'aria-hidden', 'style'],
+      })
+    }
+    closePopoversForHiddenOwner()
   } else {
     document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
   }
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  popoverOwnerObserver?.disconnect()
   document.removeEventListener('pointerdown', closeOpenPopoversFromOutside, true)
 })
 
@@ -964,7 +1029,8 @@ function focusTextarea(options?: { preserveFocus?: boolean }) {
   }
   if (!canFocus()) return
   nextTick(() => {
-    if (canFocus()) textareaEl.value?.focus()
+    // The editor owns selection restoration across menu focus and token updates.
+    if (canFocus()) inlineEditor.value?.focus()
   })
 }
 
@@ -1636,35 +1702,6 @@ button.attachment-chip__primary:focus-visible {
   max-width: 14rem;
 }
 
-/* The stop target needs more room than the send target in narrow composers. */
-@container chat-composer (max-width: 26rem) {
-  .chat-input-footer:has(.chat-stop-btn) .chat-run-mode-btn__label {
-    display: none;
-  }
-}
-
-/* Fit the actual chat column, including split views. Keep the writing controls
-   on one baseline; shorten labels before introducing a second toolbar row. */
-@container chat-composer (max-width: 36rem) {
-  .chat-input-footer { gap: 0.25rem; position: static; padding-inline: 0.5rem; }
-  .chat-input-actions--left { flex: 0 1 auto; gap: 0; }
-  .chat-input-actions--right { flex: 1 1 auto; min-width: 0; gap: 0.25rem; }
-  .chat-run-mode-btn__label,
-  .chat-project-choose__label,
-  .chat-project-choose__chevron,
-  .chat-project-chip > span { display: none; }
-  .chat-project-choose, .chat-project-chip { padding-inline: 0.375rem; }
-  .chat-model-routing-anchor { max-width: min(12rem, 100%); }
-  .chat-model-routing-btn { min-width: 0; }
-  .chat-model-routing-btn__default,
-  .chat-model-routing-btn__new { display: none; }
-}
-@container chat-composer (max-width: 23rem) {
-  .chat-input-footer { padding-inline: 0.25rem; }
-  .chat-model-routing-btn__label { max-width: 6rem; }
-  .chat-model-routing-btn { gap: 0.25rem; padding-inline: 0.25rem; }
-  .chat-project-choose { max-width: 44px; overflow: hidden; }
-}
 @media (pointer: coarse) {
   .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose,
   .attachment-action { min-width: 44px; min-height: 44px; }
@@ -1763,22 +1800,6 @@ button.attachment-chip__primary:focus-visible {
   white-space: nowrap;
   font-size: var(--fs-xs);
   text-align: left;
-}
-
-.chat-model-routing-btn__dot {
-  flex: 0 0 17px;
-  width: 17px;
-  height: 17px;
-  display: grid;
-  place-items: center;
-}
-
-.chat-model-routing-btn__dot::before {
-  content: "";
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent);
 }
 
 .chat-model-routing-btn__default {
@@ -1923,6 +1944,8 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-stop-btn {
+  /* Cancellation stays a full-size target even when labels collapse. */
+  --composer-control-size: 44px;
   min-width: 44px;
   min-height: 44px;
 }
@@ -2009,6 +2032,85 @@ button.attachment-chip__primary:focus-visible {
 .chat-send-btn[aria-busy='true']:disabled {
   cursor: progress;
   opacity: 1;
+}
+
+/* Density is measured once for the entire toolbar against its own input panel.
+   Only presentation changes: menus, focus targets and accessible names survive. */
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) {
+  --composer-control-size: 34px;
+  gap: 0.25rem;
+  padding-inline: 0.5rem;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) .chat-input-actions--left {
+  flex: 0 1 auto;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
+  .chat-run-mode-btn__label, .chat-project-choose__label, .chat-project-choose__chevron,
+  .chat-project-chip__name, .chat-project-chip__status,
+  .chat-model-routing-btn__default, .chat-model-routing-btn__new
+) {
+  display: none;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :deep(:is(
+  .composer-goal-mode__label, .composer-plan-mode__label, .composer-plan-mode__next
+)) {
+  display: none;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) :is(
+  .chat-plus-btn, .chat-run-mode-btn, .chat-project-choose, .chat-send-btn
+) {
+  flex: 0 0 var(--composer-control-size);
+  width: var(--composer-control-size);
+  height: var(--composer-control-size);
+  min-width: var(--composer-control-size);
+  min-height: var(--composer-control-size);
+  padding: 0;
+  gap: 0;
+  justify-content: center;
+}
+
+.chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) .chat-project-chip {
+  gap: 0.25rem;
+  padding-inline: 0.375rem;
+  flex-shrink: 0;
+}
+
+.chat-input-footer[data-composer-density='compact'] .chat-model-routing-anchor {
+  max-width: 12rem;
+}
+
+.chat-input-footer[data-composer-density='icons'] {
+  /* Only an extremely narrow host or several active mode chips need a second
+     row. Keep every action usable rather than clipping or shrinking icons. */
+  flex-wrap: wrap;
+}
+
+.chat-input-footer[data-composer-density='icons'] .chat-input-actions--right,
+.chat-input-footer[data-composer-density='icons'] .chat-model-routing-anchor {
+  flex: 0 0 auto;
+}
+
+.chat-input-footer[data-composer-density='icons'] :is(.chat-model-routing-btn__label, .chat-model-routing-btn__chevron) {
+  display: none;
+}
+
+.chat-input-footer[data-composer-density='icons'] .chat-model-routing-btn {
+  width: var(--composer-control-size);
+  height: var(--composer-control-size);
+  min-width: var(--composer-control-size);
+  min-height: var(--composer-control-size);
+  padding: 0;
+  gap: 0;
+}
+
+@media (pointer: coarse) {
+  .chat-input-footer:is([data-composer-density='compact'], [data-composer-density='icons']) {
+    --composer-control-size: 44px;
+  }
 }
 
 @keyframes spin {

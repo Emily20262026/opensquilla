@@ -37,19 +37,47 @@
       />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
-          v-if="showActivityDisclosure"
+          v-if="message.isStreaming || showActivityDisclosure"
+          :class="{ 'conversation-live-edge': message.isStreaming }"
           :lifecycle="activityLifecycle"
+          :executing="message.isStreaming === true"
+          :elapsed-label="message.isStreaming ? activityCompactElapsedLabel : ''"
           :step-count="activityStepCount"
           :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="activitySummaryLabel"
-          :phase-label="hasPlan ? t('chat.plan.process') : ''"
+          :phase-label="message.isStreaming ? t(visibleActivityProjection.lifecycleLabel.code, visibleActivityProjection.lifecycleLabel.params) : hasPlan ? t('chat.plan.process') : ''"
           :completion-confirmed="activityCompletionConfirmed"
           :default-open="activityDefaultOpen"
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
           @open-change="activityDetailsOpen = $event"
         >
+          <ConversationActivityBody
+            v-if="message.isStreaming"
+            executing
+            :session-key="sessionKey || ''"
+            :has-unified-activity-order="hasUnifiedActivityOrder"
+            :display-projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
+            :reasoning-blocks="reasoningBlocks"
+            :reasoning-part="reasoningPart"
+            :tool-input-previews="message.toolInputPreviews || []"
+            :tool-state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            @toggle-group="(id, open) => $emit('toggleToolGroup', id, open)"
+            @toggle-item="(id, open) => $emit('toggleToolItem', id, open)"
+            @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+            @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
+            @extend="id => $emit('extendInterrupt', id)"
+            @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+            @clarify-dismiss="$emit('clarifyDismiss')"
+          />
+          <template v-else>
           <UnifiedAssistantActivityTimeline
             :session-key="sessionKey"
             v-if="hasUnifiedActivityOrder"
@@ -148,6 +176,7 @@
           >
             {{ t('chat.activity.recordIncomplete') }}
           </p>
+          </template>
         </ActivityDisclosure>
         <div
           v-if="activityProjection.answerPart && !hasPlan"
@@ -492,6 +521,7 @@
 
 <script setup lang="ts">
 import { visualizeReceiptsFromMessage } from '@/visualize/receipts'
+import ConversationActivityBody from './ConversationActivityBody.vue'
 import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from 'vue'
 import { HISTORY_DETAILS_READY } from '@/modules/historyDetails'
 import { useI18n } from 'vue-i18n'
@@ -752,13 +782,18 @@ const cronBadgeTitle = computed(() => safeCronSourceTool.value
   ? t('chat.provenance.cronSource', { tool: safeCronSourceTool.value })
   : t('chat.provenance.cron'))
 const showFooter = computed(() =>
-  hasMetaDetails.value
-  || (
-    planParts.value.length === 0
-    && (
-      !!props.goalOutcome
-      || isCronMessage.value
-      || (!props.shareMode && !props.message.stopNotice)
+  // A streamed row can repeatedly move provisional answer text into its tool
+  // chronology. Like the main live edge, it has no completed-message receipt
+  // or actions until this message settles; other completed rows keep theirs.
+  !props.message.isStreaming && (
+    hasMetaDetails.value
+    || (
+      planParts.value.length === 0
+      && (
+        !!props.goalOutcome
+        || isCronMessage.value
+        || (!props.shareMode && !props.message.stopNotice)
+      )
     )
   ),
 )
@@ -932,7 +967,7 @@ const activityProjection = computed(() =>
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
-      endedAt: epochMilliseconds(
+      endedAt: props.message.isStreaming ? undefined : epochMilliseconds(
         props.message.turnOutcome?.finishedAt ?? props.message.ts,
       ),
     },
@@ -1245,6 +1280,8 @@ function fmtUsd(value: number): string {
 
 </script>
 
+<style scoped src="../../styles/chat-assistant-row.css"></style>
+
 <style scoped>
 .assistant-activity-incomplete {
   margin: 0.375rem 0 0;
@@ -1258,17 +1295,6 @@ function fmtUsd(value: number): string {
   max-width: 100%;
   margin-inline: 0;
   box-sizing: border-box;
-}
-
-.msg-ai {
-  position: relative;
-  display: flex;
-  gap: 0.625rem;
-  width: var(--chat-col, min(calc(100% - 48px), 980px));
-  margin: 0 auto;
-  padding: 0.5rem 0;
-  align-items: flex-start;
-  max-width: calc(100% - 48px);
 }
 
 .msg-ai--share-mode {
@@ -1332,13 +1358,6 @@ function fmtUsd(value: number): string {
   .chat-share-picker {
     transition: none;
   }
-}
-
-.msg-ai-main {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-  padding-top: 0.0625rem;
 }
 
 .assistant-answer--separated {

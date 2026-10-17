@@ -8,6 +8,8 @@ import type { NativeWorkbenchApi, NativeWorkbenchCapabilities,
   NativeWorkbenchSurfaceEvent, Platform } from '@/platform/types'
 import { useConfirm } from '@/composables/useConfirm'
 import { useWorkbenchStore } from '@/workbench/store'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import { createBrowserWorkbenchItem } from '@/workbench/browserItems'
 import en from '@/locales/en.json'
@@ -78,7 +80,9 @@ async function mountWorkbench() {
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
   store.openItem(browser('page-a', 'session-a'))
-  const props = reactive({ routeActive: true, sessionId: 'session-a' })
+  // The 600px rectangle above describes the native slot, not its workspace.
+  // Scope isolation is exercised in split view; narrow visibility is explicit.
+  const props = reactive({ routeActive: true, sessionId: 'session-a', availableWidth: 1200 })
   const element = document.createElement('div')
   document.body.append(element)
   const app = createApp({ render: () => h(AppWorkbench, props) })
@@ -102,7 +106,8 @@ async function mountWorkbench() {
   }
   const visibleLayers = () => [...element.querySelectorAll<HTMLElement>('[data-workbench-item-id]')]
     .filter(layer => layer.style.display !== 'none').map(layer => layer.dataset.workbenchItemId)
-  return { api, element, emit, pages, props, store, switchSession, visibleLayers }
+  return { api, element, emit, pages, props, store, switchSession, visibleLayers,
+    documents: useArtifactDocumentsStore(pinia), resources: useWorkbenchResourcesStore(pinia) }
 }
 
 describe('AppWorkbench retained browser session isolation', () => {
@@ -147,6 +152,33 @@ describe('AppWorkbench retained browser session isolation', () => {
     } })
     expect(harness.store.items.some(item => item.id === 'blank-target')).toBe(false)
     expect(harness.api.destroySurface).toHaveBeenCalledWith('blank-target')
+  })
+
+  it('hides a narrow native page without closing or recreating its retained session', async () => {
+    const harness = await mountWorkbench()
+    const page = harness.pages.get('page-a')!
+    page.form = 'synthetic retained input'
+    page.loggedIn = true
+    const lifecycle = vi.fn()
+    const unsubscribe = harness.store.onLifecycle(lifecycle)
+    expect(page.visible).toBe(true)
+
+    harness.props.availableWidth = 600
+    await settle()
+    expect(page.visible).toBe(false)
+    expect(harness.store.expanded).toBe(true)
+    expect(harness.store.hostAvailable).toBe(true)
+    expect(harness.pages.get('page-a')).toBe(page)
+    expect(harness.api.navigateSurface).not.toHaveBeenCalled()
+    expect(harness.api.destroySurface).not.toHaveBeenCalled()
+
+    harness.props.availableWidth = 1200
+    await settle()
+    expect(harness.pages.get('page-a')).toBe(page)
+    expect(page).toMatchObject({ form: 'synthetic retained input', loggedIn: true, visible: true })
+    expect(harness.api.createSurface).toHaveBeenCalledOnce()
+    expect(lifecycle).not.toHaveBeenCalled()
+    unsubscribe()
   })
 
   it('switches through the mounted scope watcher without closing or recreating dirty pages', async () => {
@@ -211,7 +243,8 @@ describe('AppWorkbench retained browser session isolation', () => {
       .toBe('https://example.test/session-b')
 
     await harness.switchSession('session-a')
-    expect(harness.visibleLayers()).toEqual(['popup-a'])
+    // Background popups are retained without replacing the user's selection.
+    expect(harness.visibleLayers()).toEqual(['page-a'])
     expect(harness.store.visibleItems.map(item => item.id)).toEqual(['page-a', 'popup-a'])
     expect(harness.api.createSurface).toHaveBeenCalledTimes(2)
   })
@@ -242,8 +275,10 @@ describe('AppWorkbench retained browser session isolation', () => {
     expect(harness.visibleLayers()).toEqual(['page-b'])
   })
 
-  it('hides the prior session while another panel saves and fences rapid scope changes', async () => {
+  it('switches immediately without close guards or disposing the old owner', async () => {
     const harness = await mountWorkbench()
+    const clearDocuments = vi.spyOn(harness.documents, 'clearSession')
+    const clearResources = vi.spyOn(harness.resources, 'clearSession')
     let finishSave!: (accepted: boolean) => void
     const saving = new Promise<boolean>(resolve => { finishSave = resolve })
     const beforeClose = vi.fn(() => saving)
@@ -255,15 +290,17 @@ describe('AppWorkbench retained browser session isolation', () => {
     await settle()
 
     await harness.switchSession('session-b')
-    expect(beforeClose).toHaveBeenCalledOnce()
-    expect(harness.store.activeSessionId).toBe('session-a')
+    expect(beforeClose).not.toHaveBeenCalled()
+    expect(clearDocuments).not.toHaveBeenCalled()
+    expect(clearResources).not.toHaveBeenCalled()
+    expect(harness.store.activeSessionId).toBe('session-b')
     expect(harness.element.querySelector<HTMLElement>('[data-testid="workbench-host"]')?.style.display)
       .toBe('none')
     expect(harness.pages.get('page-a')?.visible).toBe(false)
     await harness.emit({ version: 2, surfaceId: 'popup-b', type: 'browser-opened', detail: {
       sessionKey: 'session-b', url: 'https://example.test/popup-b', targetRef: 'target-popup-b',
     } })
-    expect(harness.store.activeItemId).toBe('page-a')
+    expect(harness.store.activeItemId).toBe('popup-b')
 
     await harness.switchSession('session-c')
     finishSave(true)
@@ -271,7 +308,7 @@ describe('AppWorkbench retained browser session isolation', () => {
     expect(harness.store.activeSessionId).toBe('session-c')
     expect(harness.store.activeItemId).toBeNull()
     expect(harness.visibleLayers()).toEqual([])
-    expect(harness.store.items.map(item => item.id)).toEqual(['page-a', 'popup-b'])
+    expect(harness.store.items.map(item => item.id)).toEqual(['page-a', 'saving-panel', 'popup-b'])
     expect(harness.api.navigateSurface).not.toHaveBeenCalled()
     expect(harness.api.destroySurface).not.toHaveBeenCalled()
 

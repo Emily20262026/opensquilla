@@ -3,7 +3,7 @@
 The Gateway deliberately keeps the native PTY behind the existing
 ``opensquilla.tools.pty_backend`` adapter.  This module owns only the public
 session lifecycle: a terminal is bound to one WebSocket connection, one
-session key and the workspace binding captured when it was created.  Output
+explicit directory target and the workspace binding captured when it was created. Output
 is sent as bounded, sequenced events; there is no unbounded replay buffer.
 """
 
@@ -14,7 +14,7 @@ import codecs
 import os
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +35,9 @@ MAX_TERMINALS_PER_CONNECTION = 4
 MAX_COMMAND_CHARS = 4096
 MAX_WRITE_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024
+OUTPUT_HIGH_WATER_BYTES = 128 * 1024
+OUTPUT_LOW_WATER_BYTES = 32 * 1024
+MAX_OUTPUT_IN_FLIGHT_FRAMES = 256
 MAX_COLS = 400
 MAX_ROWS = 200
 MAX_CLOSED_TERMINALS = 256
@@ -60,18 +63,24 @@ SendEvent = Callable[[str, dict[str, Any]], Awaitable[bool]]
 class TerminalSession:
     terminal_id: str
     conn_id: str
-    session_key: str
+    session_key: str | None
     workspace_binding: str
     workspace_service: Any
     handle: PtyHandle
     cwd: str
     cols: int
     rows: int
+    target: dict[str, str] | None = None
     seq: int = 0
     closing: bool = False
     close_reason: str | None = None
     workspace_checked_at: float = 0.0
     reader_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    output_flow_control: bool = False
+    consumed_seq: int = 0
+    output_in_flight_bytes: int = 0
+    output_in_flight: deque[tuple[int, int]] = field(default_factory=deque, repr=False)
+    output_consumed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 def _dimension(value: Any, default: int, maximum: int, name: str) -> int:
@@ -179,12 +188,14 @@ class TerminalManager:
         self,
         *,
         conn_id: str,
-        session_key: str,
+        session_key: str | None,
         workspace_service: Any,
         cwd: str,
         command: str | None,
         cols: int,
         rows: int,
+        target: dict[str, str] | None = None,
+        output_flow_control: bool = False,
     ) -> dict[str, Any]:
         async with self._lock:
             owned_count = sum(1 for item in self._sessions.values() if item.conn_id == conn_id)
@@ -244,22 +255,27 @@ class TerminalManager:
             self._release_create_slot(conn_id)
             raise
         except PtyBackendError as exc:
-            self._release_create_slot(conn_id)
             # Some native backends can fail after creating the child and return
             # the live handle with ``started=True``.  Reap that process tree
             # before projecting the failure to RPC; otherwise a rejected create
             # can strand a shell that has no terminal identity to close later.
-            if exc.started and exc.handle is not None:
-                try:
-                    capture_process_tree_owner(
-                        exc.handle.raw, isolated=True,
-                    ).start_completion_monitor()
-                    await terminate_pty(exc.handle)
-                except asyncio.CancelledError:
-                    self._schedule_handle_cleanup(exc.handle)
-                    raise
-                except Exception:
-                    pass
+            try:
+                if exc.started and exc.handle is not None:
+                    try:
+                        capture_process_tree_owner(
+                            exc.handle.raw, isolated=True,
+                        ).start_completion_monitor()
+                        await terminate_pty(exc.handle)
+                    except asyncio.CancelledError:
+                        self._schedule_handle_cleanup(exc.handle)
+                        raise
+                    except Exception:
+                        pass
+            finally:
+                # Cancellation can arrive during failed-spawn cleanup too.
+                # Native ownership transfers to the cleanup task, but the RPC
+                # must always release its connection's pending-create slot.
+                self._release_create_slot(conn_id)
             raise TerminalSessionError("TERMINAL_UNAVAILABLE", str(exc)) from exc
         except Exception as exc:
             self._release_create_slot(conn_id)
@@ -275,13 +291,24 @@ class TerminalManager:
             cwd=resolved_cwd,
             cols=cols,
             rows=rows,
+            output_flow_control=output_flow_control,
+            target=dict(target) if target is not None else (
+                {"kind": "session", "sessionKey": session_key} if session_key else None
+            ),
         )
         registered = False
         try:
-            # Native spawn runs without an event loop in a worker. Attach the
-            # owner status reader here so natural exit can release a POSIX
-            # anchor and Windows completion can retire the owner record.
+            # Native spawn runs in a worker without a running event loop.
+            # Start the owner monitor here before validating or publishing the
+            # handle so natural exit and failed publication both release it.
             capture_process_tree_owner(handle.raw, isolated=True).start_completion_monitor()
+            # Native spawning can outlive a project removal or configuration
+            # change. Do not publish a PTY after its target has changed.
+            current = await workspace_service.workspace(session_key)
+            if current.binding != workspace.binding:
+                raise TerminalSessionError(
+                    "TERMINAL_STALE", "The terminal working directory changed"
+                )
             async with self._lock:
                 # Recheck after the potentially slow native spawn. A
                 # concurrent create cannot use the race to exceed the
@@ -305,11 +332,20 @@ class TerminalManager:
         self._release_create_slot(conn_id)
         return {
             "terminalId": terminal_id,
-            "sessionKey": session_key,
+            **self._target_metadata(session),
             "cwd": resolved_cwd,
+            "cwdPath": str(directory),
             "cols": cols,
             "rows": rows,
             "shell": "powershell" if os.name == "nt" else "posix",
+            **({"outputFlowControl": "consumed-v1"} if output_flow_control else {}),
+        }
+
+    @staticmethod
+    def _target_metadata(session: TerminalSession) -> dict[str, Any]:
+        return {
+            **({"sessionKey": session.session_key} if session.session_key is not None else {}),
+            **({"target": dict(session.target)} if session.target is not None else {}),
         }
 
     async def _ensure_current(self, session: TerminalSession) -> None:
@@ -363,6 +399,45 @@ class TerminalManager:
         session.cols, session.rows = cols, rows
         return {"terminalId": terminal_id, "cols": cols, "rows": rows}
 
+    async def consume(self, *, terminal_id: str, conn_id: str, seq: object) -> dict[str, Any]:
+        """Release output credits only after the owning emulator consumed them."""
+        if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= 2**53 - 1:
+            raise TerminalSessionError("INVALID_REQUEST", "seq must be a positive safe integer")
+        try:
+            session = self._owned(terminal_id, conn_id)
+        except TerminalSessionError as exc:
+            # Parser callbacks can arrive after a natural process exit. Nothing
+            # remains buffered, but retain the same connection ownership fence.
+            if exc.code == "TERMINAL_NOT_FOUND" and self._closed.get(terminal_id) == conn_id:
+                return {"terminalId": terminal_id, "consumedSeq": seq}
+            raise
+        if not session.output_flow_control or seq > session.seq:
+            raise TerminalSessionError("INVALID_REQUEST", "seq is not emitted terminal output")
+        if seq > session.consumed_seq:
+            session.consumed_seq = seq
+            while session.output_in_flight and session.output_in_flight[0][0] <= seq:
+                _, size = session.output_in_flight.popleft()
+                session.output_in_flight_bytes -= size
+            session.output_consumed.set()
+        return {"terminalId": terminal_id, "consumedSeq": session.consumed_seq}
+
+    async def _wait_output_capacity(self, session: TerminalSession) -> bool:
+        if not session.output_flow_control:
+            return True
+        if (session.output_in_flight_bytes < OUTPUT_HIGH_WATER_BYTES
+                and len(session.output_in_flight) < MAX_OUTPUT_IN_FLIGHT_FRAMES):
+            return not session.closing
+        # Do not read another PTY block while the emulator is behind. Native
+        # pipes/socketpair provide backpressure; there is no Python output tail.
+        # Hysteresis avoids a pause/resume cycle for every tiny consumed frame.
+        while (not session.closing and (
+            session.output_in_flight_bytes > OUTPUT_LOW_WATER_BYTES
+            or len(session.output_in_flight) > MAX_OUTPUT_IN_FLIGHT_FRAMES // 4
+        )):
+            session.output_consumed.clear()
+            await session.output_consumed.wait()
+        return not session.closing
+
     async def close(
         self, *, terminal_id: str, conn_id: str, reason: str = "client_closed"
     ) -> dict[str, Any]:
@@ -387,6 +462,7 @@ class TerminalManager:
             return
         session.closing = True
         session.close_reason = reason
+        session.output_consumed.set()
         try:
             await terminate_pty(session.handle)
         except Exception:
@@ -404,6 +480,8 @@ class TerminalManager:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
+                if not await self._wait_output_capacity(session):
+                    break
                 try:
                     data = await read_pty(session.handle, MAX_OUTPUT_BYTES)
                 except EOFError:
@@ -411,16 +489,25 @@ class TerminalManager:
                 if not data:
                     break
                 for start in range(0, len(data), MAX_OUTPUT_BYTES):
+                    if not await self._wait_output_capacity(session):
+                        break
                     chunk = data[start:start + MAX_OUTPUT_BYTES]
                     text = decoder.decode(chunk, final=False)
                     if not text:
                         continue
                     session.seq += 1
+                    if session.output_flow_control:
+                        # Count UTF-8 bytes actually sent, including replacement
+                        # characters. Overshoot is bounded by one decoded chunk
+                        # (at most 3 * MAX_OUTPUT_BYTES for invalid UTF-8).
+                        size = len(text.encode("utf-8"))
+                        session.output_in_flight.append((session.seq, size))
+                        session.output_in_flight_bytes += size
                     sent = await self._send_event(
                         "terminal.output",
                         {
                             "terminalId": session.terminal_id,
-                            "sessionKey": session.session_key,
+                            **self._target_metadata(session),
                             "seq": session.seq,
                             "data": text,
                             "encoding": "utf8",
@@ -439,6 +526,16 @@ class TerminalManager:
         except Exception:
             session.closing = True
             session.close_reason = session.close_reason or "reader_error"
+            # Losing the reader does not mean its shell has exited. Reap the
+            # process before wait_pty below; later close requests see closing
+            # and only await this task, so they cannot rescue a live shell.
+            try:
+                await terminate_pty(session.handle)
+            except asyncio.CancelledError:
+                self._schedule_handle_cleanup(session.handle)
+                raise
+            except Exception:
+                self._schedule_handle_cleanup(session.handle)
         finally:
             # Flush a partial UTF-8 code point once the PTY reaches EOF. This
             # avoids replacing a split multibyte character twice across reads.
@@ -450,7 +547,7 @@ class TerminalManager:
                         "terminal.output",
                         {
                             "terminalId": session.terminal_id,
-                            "sessionKey": session.session_key,
+                            **self._target_metadata(session),
                             "seq": session.seq,
                             "data": tail,
                             "encoding": "utf8",
@@ -468,7 +565,7 @@ class TerminalManager:
                     "terminal.exit",
                     {
                         "terminalId": session.terminal_id,
-                        "sessionKey": session.session_key,
+                        **self._target_metadata(session),
                         "seq": session.seq,
                         "exitCode": returncode,
                         "signal": None,

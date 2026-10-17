@@ -148,6 +148,7 @@ METHOD_SCOPES: dict[str, str] = {
     "terminal.write": WRITE_SCOPE,
     "terminal.resize": WRITE_SCOPE,
     "terminal.close": WRITE_SCOPE,
+    "terminal.consume": WRITE_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
@@ -265,6 +266,8 @@ METHOD_SCOPES: dict[str, str] = {
     SESSIONS_CREATE_METHOD: WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
+    "sessions.sidechat.create": WRITE_SCOPE,
+    "sessions.sidechat.close": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
     "sessions.routing.set": WRITE_SCOPE,
     "sessions.pending_inputs.enqueue": WRITE_SCOPE,

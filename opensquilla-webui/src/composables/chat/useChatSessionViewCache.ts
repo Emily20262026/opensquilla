@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
 import type { ChatMessage } from '@/types/chat'
+import { createChatViewCaptureBudget } from './chatViewCaptureBudget'
 
 interface ViewSnapshot<Presentation, Viewport> {
   messages: ChatMessage[]
@@ -13,6 +14,8 @@ interface Options<Presentation, Viewport> {
   sessionKey: Readonly<Ref<string>>
   deliveryIdentity: Readonly<Ref<string | null>>
   messages: Readonly<Ref<ChatMessage[]>>
+  /** Exact current read lease; presentation receipts must never outlive it. */
+  currentReadAuthority?: () => unknown
   capturePresentation?: (key: string) => Presentation
   captureViewport?: (retainedMessages: readonly ChatMessage[]) => Viewport
   waitForLive?: boolean
@@ -32,8 +35,10 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
   const restoredViewport = shallowRef<Viewport | undefined>()
   const historyReady = ref(false)
   let historyConfirmed = false
+  let historyAuthority: unknown = null
   const liveReady = ref(!options.waitForLive)
   let liveConfirmed = !options.waitForLive
+  let liveAuthority: unknown = null
   const generation = ref(0)
   const maxSessions = options.maxSessions ?? 6
   const maxBytes = options.maxBytes ?? 8 * 1024 * 1024
@@ -41,6 +46,9 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
   let totalBytes = 0
   let installed = false
   let epoch: number | null = null
+  let epochAuthority: unknown = null
+  let hasProvenIdentity = options.deliveryIdentity.value !== null
+  const currentAuthority = () => options.currentReadAuthority?.() ?? null
 
   function remove(key: string) {
     const previous = snapshots.get(key)
@@ -50,17 +58,19 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
 
   function capture(key: string) {
     if (!installed || !options.deliveryIdentity.value || !key) return
+    remove(key)
+    if (maxSessions <= 0) return
     // Clone once on departure: mutable live/history objects cannot change a
     // detached view, and serialization accounts for nested tool/reasoning data.
     const retainedMessages = options.messages.value.slice(-maxMessages)
-    const serialized = JSON.stringify({
-      messages: retainedMessages,
-      presentation: options.capturePresentation?.(key),
-      viewport: options.captureViewport?.(retainedMessages),
-    })
-    const bytes = new TextEncoder().encode(serialized).byteLength
-    remove(key)
-    if (bytes > maxBytes || maxSessions <= 0) return
+    const budget = createChatViewCaptureBudget(maxBytes)
+    if (!budget.include('messages', retainedMessages)) return
+    const presentation = options.capturePresentation?.(key)
+    if (!budget.include('presentation', presentation)) return
+    const viewport = options.captureViewport?.(retainedMessages)
+    if (!budget.include('viewport', viewport)) return
+    const serialized = JSON.stringify({ messages: retainedMessages, presentation, viewport })
+    const bytes = budget.bytes
     snapshots.set(key, { ...JSON.parse(serialized), bytes, epoch })
     totalBytes += bytes
     while (snapshots.size > maxSessions || totalBytes > maxBytes) {
@@ -78,25 +88,47 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
       preview.value = null
       installed = false
       epoch = null
+      epochAuthority = null
       restoredViewport.value = undefined
       historyReady.value = false
       historyConfirmed = false
+      historyAuthority = null
       liveReady.value = !options.waitForLive
       liveConfirmed = !options.waitForLive
+      liveAuthority = null
     }
     // Also retires completed-body and disclosure caches at the composition root.
     generation.value += 1
   }
 
-  watch(options.deliveryIdentity, () => invalidate(), { flush: 'sync' })
+  watch(options.deliveryIdentity, (identity, previous) => {
+    const authority = currentAuthority()
+    const firstProof = !hasProvenIdentity && previous === null && identity !== null
+    hasProvenIdentity ||= identity !== null
+    // Target hashing runs alongside the first transport read. Its first proof
+    // can arrive after either installation receipt, without a second read to
+    // reopen the barrier. Adopt only receipts from the exact still-current
+    // lease. A replacement/revoked identity always needs fresh installations.
+    const adopt = firstProof && authority !== null
+    const keepHistory = adopt && historyReady.value && historyConfirmed && historyAuthority === authority
+    const keepLive = adopt && liveReady.value && liveConfirmed && liveAuthority === authority
+    const keepEpoch = adopt && epochAuthority === authority ? epoch : null
+    invalidate()
+    if (keepEpoch !== null) observeEpoch(options.sessionKey.value, keepEpoch)
+    if (keepHistory) historyInstalled(options.sessionKey.value)
+    if (keepLive) liveInstalled(options.sessionKey.value)
+  }, { flush: 'sync' })
   watch(options.sessionKey, (key, previous) => {
     capture(previous)
     installed = false
     historyReady.value = false
     historyConfirmed = false
+    historyAuthority = null
     liveReady.value = !options.waitForLive
     liveConfirmed = !options.waitForLive
+    liveAuthority = null
     epoch = null
+    epochAuthority = null
     const cached = options.deliveryIdentity.value ? snapshots.get(key) : undefined
     if (cached) {
       snapshots.delete(key)
@@ -111,6 +143,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (key !== options.sessionKey.value) return
     historyReady.value = true
     historyConfirmed = authoritative
+    historyAuthority = authoritative ? currentAuthority() : null
     releasePreview()
   }
 
@@ -125,6 +158,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     installed = false
     liveReady.value = false
     liveConfirmed = false
+    liveAuthority = null
   }
 
   function retirePreview(key: string) {
@@ -137,6 +171,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     installed = false
     liveReady.value = false
     liveConfirmed = false
+    liveAuthority = null
   }
 
   function liveInstalled(key: string, authoritative = true) {
@@ -147,6 +182,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (!authoritative && preview.value) return
     liveReady.value = true
     liveConfirmed = authoritative
+    liveAuthority = authoritative ? currentAuthority() : null
     releasePreview()
   }
 
@@ -163,6 +199,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     const previous = epoch ?? preview.value?.epoch
     if (previous != null && previous !== next) invalidate(key)
     epoch = next
+    epochAuthority = currentAuthority()
   }
 
   onScopeDispose(() => {

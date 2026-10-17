@@ -5,6 +5,11 @@
     :show-toolbar="Boolean(store.activeItem && (showArtifactNavigation(store.activeItem) || visiblePanelToolbarItems(store.activeItem).length))"
     @tab-menu="openTabMenu"
     :enabled="enabled"
+    :available-width="availableWidth"
+    :layout-mode="layoutMode"
+    :motion-enabled="motionEnabled"
+    :animate-layout="animateLayout"
+    :return-label="t('workbench.returnToChat')"
     :allow-empty="newPanelMenuVisible"
     :route-active="routeActive && store.activeSessionId === (sessionId || null)"
     :modal-blocked="modalBlocked"
@@ -21,10 +26,14 @@
     :pixels-label="t('workbench.pixels')"
     :before-close-item="beforeCloseItem"
     @collapsed="restoreWorkbenchFocus"
+    @return-chat="emit('return-chat')"
     @emptied="restoreWorkbenchFocus"
     @focus-return="restoreWorkbenchFocus"
     @surface-rect="onSurfaceRect"
   >
+    <template v-if="$slots['collapse-control']" #collapse-control>
+      <slot name="collapse-control" />
+    </template>
     <template #title="{ item }">
       <span class="app-workbench__identity">
         <Icon
@@ -42,7 +51,7 @@
       </span>
     </template>
 
-    <template #actions="{ item }">
+    <template #tab-actions>
       <div
         v-if="newPanelMenuVisible"
         ref="newPanelMenuRoot"
@@ -100,6 +109,8 @@
         </div>
         </Teleport>
       </div>
+    </template>
+    <template #actions="{ item }">
       <button v-if="item" type="button" class="app-workbench__action"
         :aria-label="t('resourceActions.more')" :title="t('resourceActions.more')" aria-haspopup="menu"
         data-testid="workbench-tab-actions" @click="openTabMenu(item, $event)"
@@ -228,7 +239,7 @@
         @open="openBrowserUrl($event, true)"
         @reopen="reopenBrowser"
       />
-      <section v-else class="app-workbench__start" data-testid="workbench-start-panel">
+      <section v-else class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
         <h2>{{ t('workbench.newPanel.title') }}</h2>
         <div class="app-workbench__start-options">
           <button
@@ -257,7 +268,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, false)"
-        v-on="{ 'workbench-event': panelEventHandler(item) }"
+        v-on="{ workbenchEvent: panelEventHandler(item) }"
       />
       <div v-else class="app-workbench__unsupported">
         {{ t('workbench.empty') }}
@@ -270,7 +281,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, true)"
-        v-on="{ 'workbench-event': panelEventHandler(item) }"
+        v-on="{ workbenchEvent: panelEventHandler(item) }"
       />
     </template>
   </WorkbenchHost>
@@ -292,13 +303,14 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import { useSideChatLauncher, type SideChatLaunchHandle, type SideChatLaunchRequest } from '@/modules/sideChatLauncher'
 import type { IconName } from '@/utils/icons'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDialogLayer, useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
-import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
@@ -347,7 +359,7 @@ import {
 } from '@/workbench/resourceCapabilityPresentation'
 import {
   artifactPayloadFromWorkbenchResource,
-  createResourceCollectionWorkbenchItem,
+  refreshResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   resourceUsesNativeHtmlPreview,
   resourceCollectionWorkbenchItemId,
@@ -364,8 +376,10 @@ import {
 import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
 import { createWorkspaceFilesWorkbenchItem } from '@/workbench/workspaceFileItems'
+import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { createTerminalWorkbenchItem } from '@/workbench/terminalItems'
 import { createAssistantChatWorkbenchItem } from '@/workbench/assistantChatItems'
+import { closeAssistantChatOwner } from '@/modules/assistantChat'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type {
   NativeSurfaceRect,
@@ -395,19 +409,30 @@ import { createTerminalWorkbenchDefinition } from './terminalWorkbenchProvider'
 import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbenchProvider'
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
+import type { WorkbenchLayoutMode } from '@/workbench/layout'
 import BrowserStartPanel from './BrowserStartPanel.vue'
 import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
 import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
 import { createNativeTabSnapshots } from './nativeTabSnapshots'
 
+const emit = defineEmits<{ 'return-chat': [] }>()
 const props = withDefaults(defineProps<{
   enabled?: boolean
+  availableWidth?: number
+  layoutMode?: WorkbenchLayoutMode
+  motionEnabled?: boolean
+  animateLayout?: boolean
   modalBlocked?: boolean
   workbenchResourcesEnabled?: boolean
   promptAnnotationsEnabled?: boolean
   officePromptAnnotationsEnabled?: boolean
   routeActive?: boolean
   sessionId?: string
+  conversationStarted?: boolean
+  sessionDurable?: boolean
+  sessionLoading?: boolean
+  sessionPreparable?: boolean
+  prepareSession?: (expectedSessionKey: string) => Promise<string | null>
   workspaceId?: string | null
   workspaceReady?: boolean
   workspaceResolved?: boolean
@@ -419,6 +444,10 @@ const props = withDefaults(defineProps<{
   officePromptAnnotationsEnabled: false,
   routeActive: false,
   sessionId: '',
+  conversationStarted: false,
+  sessionDurable: false,
+  sessionLoading: false,
+  sessionPreparable: false,
   workspaceId: null,
   workspaceReady: false,
   workspaceResolved: false,
@@ -430,6 +459,21 @@ const { pushToast } = useToasts()
 const platform = usePlatform()
 const nativeApi = platform.workbench.native
 const store = useWorkbenchStore()
+// Every producer uses the same admission boundary, including automatic agent
+// artifacts and main/side file links that do not pass through this component.
+const stopAdmissionNotifications = store.onAdmissionRejected(rejection => {
+  if (rejection.reason === 'native-preview-capacity') {
+    pushToast(t('workbench.nativePreview.capacityReached', { limit: rejection.limit }),
+      { tone: 'warn', duration: 9000 })
+  } else if (rejection.reason === 'browser-capacity') {
+    pushToast(t('workbench.browser.capacityReached', { limit: rejection.limit }),
+      { tone: 'warn', duration: 9000 })
+  }
+})
+const sideChatLauncher = useSideChatLauncher()
+const sideChatHandles = new Map<string, SideChatLaunchHandle>()
+const sideChatLaunchItems = new Map<string, { itemId: string; isCurrent(): boolean }>()
+const releaseSideChatLauncher = sideChatLauncher?.register(launchSideChatCommand)
 const workspaceReferences = inject(WORKSPACE_REFERENCES_KEY, null)
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const terminal = inject(TERMINAL_ACCESS_KEY, null)
@@ -457,19 +501,40 @@ const newPanelMenu = ref<HTMLElement | null>(null)
 const newPanelMenuTrigger = ref<HTMLButtonElement | null>(null)
 const newPanelMenuStyle = ref({ left: '0px', top: '0px' })
 const sessionReady = computed(() => Boolean(props.sessionId && store.activeSessionId === props.sessionId))
+const preparingPanel = ref(false)
+let panelOpeningGeneration = 0
+const canPrepareSession = computed(() => sessionReady.value
+  && (props.sessionDurable || props.sessionPreparable && Boolean(props.prepareSession)))
 const gatewayAvailable = computed(() => Boolean(gateway?.availability === 'available'
   && gateway.isAvailable && gateway.connectionHealth === 'healthy' && !gateway.isResuming
   && (!gateway.connectionPhase || gateway.connectionPhase === 'healthy')))
 const gatewayCanExecuteHost = computed(() => gateway?.canExecuteHost === true)
 const canOpenBrowser = computed(() => Boolean(nativeApi && sessionReady.value))
 const canOpenWorkspaceFiles = computed(() => Boolean(workspaceFiles && props.workspaceId && props.workspaceReady
-  && sessionReady.value && gatewayAvailable.value && gateway?.isLocalOwner))
+  && canPrepareSession.value && gatewayAvailable.value && gateway?.isLocalOwner))
 const canOpenTerminal = computed(() => Boolean(terminal && sessionReady.value
+  && props.workspaceResolved && (!props.workspaceId || props.workspaceReady)
   && gatewayAvailable.value && gatewayCanExecuteHost.value))
-const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && gatewayAvailable.value
+const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && props.sessionDurable && props.conversationStarted && gatewayAvailable.value
   && gateway?.deliveryIdentity && assistantPortsAvailable && props.workspaceResolved
+  && (!assistantSessionLifecycle?.supportsSidechat || assistantSessionLifecycle.supportsSidechat())
   && (!props.workspaceId || props.workspaceReady)))
 const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
+
+const panelContextLoading = computed(() => !sessionReady.value || props.sessionLoading)
+// A pending session has unknown capabilities, not fewer capabilities. Preserve
+// the last settled entry positions while resolving the next session; these are
+// presentation keys only and never grant access to the previous session.
+const settledPanelKinds = ref<NewPanelKind[] | null>(null)
+const visiblePanelKinds = computed<NewPanelKind[]>(() => [
+  'browser',
+  ...(props.workspaceId ? ['workspace-files' as const] : []),
+  'terminal',
+  ...(props.sessionDurable && props.conversationStarted ? ['assistant-chat' as const] : []),
+])
+watch([panelContextLoading, visiblePanelKinds], ([loading, kinds]) => {
+  if (!loading) settledPanelKinds.value = kinds
+}, { immediate: true })
 
 function sessionUnavailableReason(): string {
   return t('workbench.newPanel.requiresSession')
@@ -500,7 +565,8 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
       disabledReason: canOpenTerminal.value ? undefined : sessionReason
         || (!gatewayAvailable.value || gateway?.hostExecuteUnavailableReason === 'disconnected'
           ? gatewayUnavailableReason() : gateway?.hostExecuteUnavailableReason === 'permission'
-          ? t('workbench.newPanel.requiresHostExecute') : t('workbench.newPanel.terminalUnavailable')),
+          ? t('workbench.newPanel.requiresHostExecute') : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
+            ? t('workbench.newPanel.workspaceNotReady') : t('workbench.newPanel.terminalUnavailable')),
     },
     {
       kind: 'assistant-chat', label: t('workbench.newPanel.assistantChat'), icon: 'chat',
@@ -508,34 +574,85 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
       disabledReason: canOpenAssistantChat.value ? undefined : sessionReason
         || (!gatewayAvailable.value ? gatewayUnavailableReason()
           : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
-            ? t('workbench.newPanel.workspaceUnavailable')
+            ? t('workbench.newPanel.workspaceNotReady')
             : t('workbench.newPanel.assistantUnavailable')),
     },
   ]
-  return options.filter(option => option.kind !== 'workspace-files' || Boolean(props.workspaceId))
+  const kinds = panelContextLoading.value && settledPanelKinds.value
+    ? settledPanelKinds.value : visiblePanelKinds.value
+  return options.filter(option => kinds.includes(option.kind))
+    .map(option => preparingPanel.value || panelContextLoading.value ? { ...option, disabled: true,
+      disabledReason: t('workbench.newPanel.preparing') } : option)
 })
+watch(() => [props.sessionId, props.workspaceId, props.routeActive, props.enabled, props.modalBlocked, store.expanded,
+  gateway?.subscriptionEpoch, gateway?.deliveryIdentity, gatewayAvailable.value], () => {
+  panelOpeningGeneration += 1
+  preparingPanel.value = false
+}, { flush: 'sync' })
 watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability,
-  referenceGateway?.isLocalOwner, referenceGateway?.deliveryIdentity], () => {
+  referenceGateway?.isLocalOwner, referenceGateway?.deliveryIdentity], (next, previous) => {
   // A filesystem snapshot is valid only for the connection that authorized it.
   for (const item of [...store.items]) {
     if (item.kind === 'file' || item.kind === 'workspace-files' || item.kind === 'terminal'
-      || item.kind === 'assistant-chat' || item.kind === 'tool-file-history') store.closeItem(item.id, 'scope-changed')
+      || item.kind === 'tool-file-history'
+      || item.kind === 'assistant-chat' && previous && next[3] !== previous[3]) store.closeItem(item.id, 'scope-changed')
   }
 })
-watch(() => props.workspaceId, () => {
-  for (const item of [...store.items]) {
-    if (item.scope.type === 'session' && item.scope.id === props.sessionId
-      && ['workspace-files', 'terminal', 'assistant-chat'].includes(item.kind)) {
-      store.closeItem(item.id, 'scope-changed')
+// Durability gates creation, not the lifetime of an existing side chat.
+// ChatView changes its draft flag before publishing the next session key, and
+// the route-header bridge also defaults to false while an owner is loading.
+// Scope switching hides retained side chats; only explicit close retires them.
+const resolvedWorkspaceBindings = new Map<string, string | null>()
+watch(() => [props.sessionId, props.workspaceId, props.workspaceResolved] as const,
+  ([sessionId, workspaceId, resolved]) => {
+    if (!sessionId || !resolved) return
+    const binding = workspaceId || null
+    const hadBinding = resolvedWorkspaceBindings.has(sessionId)
+    const previousBinding = resolvedWorkspaceBindings.get(sessionId)
+    resolvedWorkspaceBindings.set(sessionId, binding)
+    if (!hadBinding || previousBinding === binding) return
+    // Only a resolved rebinding of this owner invalidates its tools. Visiting
+    // another session (including its unresolved loading phase) is not rebinding.
+    for (const item of [...store.items]) {
+      if (item.scope.type === 'session' && item.scope.id === sessionId
+        && ['workspace-files', 'terminal'].includes(item.kind)) {
+        store.closeItem(item.id, 'scope-changed')
+      }
     }
-  }
-})
+  }, { immediate: true })
+
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const artifactWorkbench = injectedArtifactWorkbench
 const artifactDocuments = useArtifactDocumentsStore()
 const artifactPromptAnnotations = useArtifactPromptAnnotationsStore()
 const workbenchResources = useWorkbenchResourcesStore()
+// Metadata is reconstructible; open document owners and displayed inventories
+// are not cache entries. Keep their heads while hidden edits/actions are alive.
+const metadataOwners = new Map<string, () => void>()
+watch(() => [store.items, store.activeSessionId] as const, () => {
+  const wanted = new Set<string>()
+  for (const item of store.items) {
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) continue
+    const sessionKey = sessionKeyFromWorkbenchItem(item)
+    const key = `document:${artifactDocumentWorkspaceKey(artifact, sessionKey)}`
+    wanted.add(key)
+    if (!metadataOwners.has(key)) metadataOwners.set(key, artifactDocuments.retain(artifact, sessionKey))
+  }
+  const sessionKey = store.activeSessionId || ''
+  if (sessionKey) {
+    const key = `inventory:${sessionKey}`
+    wanted.add(key)
+    if (!metadataOwners.has(key)) metadataOwners.set(key, workbenchResources.retain(sessionKey))
+  }
+  for (const [key, release] of metadataOwners) {
+    if (wanted.has(key)) continue
+    metadataOwners.delete(key)
+    release()
+  }
+}, { immediate: true, flush: 'sync' })
+onBeforeUnmount(() => { for (const release of metadataOwners.values()) release(); metadataOwners.clear() })
 const artifactDocumentProvider = artifactWorkbench.documents
 artifactDocuments.setProvider(artifactDocumentProvider)
 const workbenchResourceProvider = artifactWorkbench.resources
@@ -786,17 +903,54 @@ function onNewPanelOutside(event: PointerEvent) {
 }
 
 function onNewPanelViewportChange(event: Event) {
-  if (event.target instanceof Node && newPanelMenu.value?.contains(event.target)) return
-  closeNewPanelMenu()
+  if (!newPanelMenuOpen.value) return
+  const anchor = newPanelMenuTrigger.value
+  if (!anchor?.isConnected) {
+    closeNewPanelMenu()
+    return
+  }
+  // Capture also sees transcript/editor/tab-list scrolling. Those independent
+  // surfaces do not move this menu's anchor. Even the pane's opening animation
+  // can scroll an ancestor after the + click; keep the menu and track its anchor.
+  if (event.type === 'scroll' && event.target instanceof Node && !event.target.contains(anchor)) return
+  const rect = anchor.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) {
+    closeNewPanelMenu()
+    return
+  }
+  positionNewPanelMenu()
 }
 
-function selectNewPanel(option: NewPanelOption) {
+async function selectNewPanel(option: NewPanelOption) {
+  if (!props.routeActive || !props.enabled || props.modalBlocked || !store.expanded) return
   if (option.disabled || newPanelOptions.value.find(current => current.kind === option.kind)?.disabled !== false) return
   closeNewPanelMenu()
-  if (option.kind === 'browser') openBrowserStart()
-  else if (option.kind === 'workspace-files') openWorkspaceFiles()
-  else if (option.kind === 'terminal') openTerminal()
-  else if (option.kind === 'assistant-chat') openAssistantChat()
+  if (option.kind === 'browser') { openBrowserStart(); return }
+  // A PTY or an empty side chat is not a durable main-chat session.
+  if (option.kind === 'terminal') { openTerminal(); return }
+  if (option.kind === 'assistant-chat') { openAssistantChat(); return }
+  const sourceSession = props.sessionId
+  const sourceWorkspace = props.workspaceId
+  const sourceEpoch = gateway?.subscriptionEpoch
+  const sourceIdentity = gateway?.deliveryIdentity
+  const generation = ++panelOpeningGeneration
+  const isCurrent = () => generation === panelOpeningGeneration && props.routeActive && props.enabled && !props.modalBlocked
+    && props.sessionId === sourceSession && props.workspaceId === sourceWorkspace
+    && gateway?.subscriptionEpoch === sourceEpoch && gateway?.deliveryIdentity === sourceIdentity
+    && gatewayAvailable.value && store.expanded
+  preparingPanel.value = true
+  try {
+    const key = props.sessionDurable ? sourceSession : await props.prepareSession?.(sourceSession)
+    await nextTick()
+    if (!key || key !== sourceSession || !isCurrent() || !props.sessionDurable) return
+    closeNewPanelMenu()
+    if (option.kind === 'workspace-files') openWorkspaceFiles()
+  } catch (error) {
+    if (isCurrent()) pushToast(error instanceof Error ? error.message : t('workbench.newPanel.prepareFailed'),
+      { tone: 'danger', duration: 6000 })
+  } finally {
+    if (generation === panelOpeningGeneration) preparingPanel.value = false
+  }
 }
 
 function openBrowserUrl(value: string, newTab = false) {
@@ -825,10 +979,13 @@ function openBrowserUrl(value: string, newTab = false) {
   if (retained && !newTab) {
     store.activateItem(retained.id)
     store.setExpanded(true)
+    store.requestReveal()
     return
   }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -837,6 +994,7 @@ function openBrowserStart() {
   browserStartRequested.value = true
   browserStartSequence.value += 1
   store.openEmpty()
+  store.requestReveal()
 }
 
 function openWorkspaceFiles() {
@@ -845,26 +1003,68 @@ function openWorkspaceFiles() {
   const item = { ...createWorkspaceFilesWorkbenchItem(sessionId), title: t('workbench.newPanel.workspaceFiles') }
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
 function openTerminal() {
   const sessionId = props.sessionId
   if (!canOpenTerminal.value) return
-  const item = { ...createTerminalWorkbenchItem(sessionId), title: t('workbench.newPanel.terminal') }
+  const item = { ...createTerminalWorkbenchItem(sessionId, props.workspaceId
+    ? { kind: 'project', workspaceId: props.workspaceId }
+    : { kind: 'default-agent', agentId: agentIdFromSessionKey(sessionId) }), title: t('workbench.newPanel.terminal') }
   if (!store.openItem(item)) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    pushToast(t('workbench.terminal.capacityReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
-function openAssistantChat() {
-  if (!canOpenAssistantChat.value) return
+function openAssistantChat(): WorkbenchItem | null {
+  if (!canOpenAssistantChat.value) return null
   const item = createAssistantChatWorkbenchItem(props.sessionId,
     props.workspaceReady ? props.workspaceId || undefined : undefined,
     t('workbench.newPanel.assistantChat'))
   if (!store.openItem(item)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+    return null
+  } else {
+    store.requestReveal()
   }
+  return item
+}
+
+async function launchSideChatCommand(request: SideChatLaunchRequest): Promise<boolean> {
+  const workspaceId = props.workspaceId
+  const current = () => request.isCurrent() && props.routeActive && props.enabled && !props.modalBlocked
+    && request.parentKey === props.sessionId && props.workspaceId === workspaceId
+    && sessionReady.value && !panelContextLoading.value && canOpenAssistantChat.value
+  if (!props.sessionDurable || !props.conversationStarted) throw new Error(t('chat.slashCommands.side.requiresStarted'))
+  if (!current()) throw new Error(t('chat.slashCommands.side.unavailable'))
+  // The parent retains only its current hand-off. Discard superseded drafts,
+  // while keeping the current closed-tab tombstone so uncertain delivery can
+  // never silently become a second child send.
+  for (const [id, launch] of sideChatLaunchItems) {
+    if (!launch.isCurrent()) sideChatLaunchItems.delete(id)
+  }
+  let itemId = sideChatLaunchItems.get(request.requestId)?.itemId
+  if (itemId && !store.items.some(item => item.id === itemId)) throw new Error(t('chat.slashCommands.side.closed'))
+  if (!itemId) {
+    const item = openAssistantChat()
+    if (!item) return false
+    itemId = item.id
+    sideChatLaunchItems.set(request.requestId, { itemId, isCurrent: request.isCurrent })
+  } else {
+    store.activateItem(itemId)
+    store.setExpanded(true)
+    store.requestReveal()
+  }
+  closeNewPanelMenu()
+  await nextTick()
+  if (!current()) return false
+  const accepted = await sideChatHandles.get(itemId)?.launchSideChat({ ...request, isCurrent: current }) ?? false
+  return accepted
 }
 
 function reopenBrowser() {
@@ -879,6 +1079,8 @@ function reopenBrowser() {
     ...(source ? { contextTargetRef: source.payload.targetRef } : {}) } }
   if (!store.openItem(reopened)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  } else {
+    store.requestReveal()
   }
 }
 
@@ -897,6 +1099,7 @@ function onBrowserWorkbenchOpen(event: Event) {
   if (retained) {
     store.activateItem(retained.id)
     store.setExpanded(true)
+    store.requestReveal()
     void nextTick(() => {
       document.querySelector<HTMLInputElement>(
         `[data-workbench-item-id="${CSS.escape(retained.id)}"] .browser-preview__address`,
@@ -962,6 +1165,12 @@ for (const definition of createArtifactWorkbenchDefinitions({
   workbenchPanelRegistry.register(definition, { replace: true })
 }
 workbenchPanelRegistry.register(createWorkbenchResourceCollectionDefinition({
+  resources: item => workbenchResources.navigationResources(resourceSessionKey(item)),
+  load: async item => {
+    const snapshot = await workbenchResources.load(resourceSessionKey(item))
+    if (snapshot.error) throw new Error(snapshot.error)
+  },
+  retain: item => workbenchResources.retain(resourceSessionKey(item)),
   download: downloadWorkbenchResource,
   open: openWorkbenchResource,
   publish: publishWorkbenchResource,
@@ -1018,7 +1227,7 @@ const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
 })
 
 function resourceSessionKey(item: WorkbenchItem): string {
-  return item.scope.type === 'session' ? item.scope.id : ''
+  return sessionKeyFromWorkbenchItem(item)
 }
 
 function openResourceArtifact(
@@ -1027,9 +1236,10 @@ function openResourceArtifact(
   sessionKey: string,
   preparedPreview?: WorkbenchPreviewDescriptor,
   initialSection: 'preview' | 'source' = 'preview',
+  ownerItem?: WorkbenchItem,
 ) {
   const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
-  store.openItem(artifactPreviewItemForExplicitOpen({
+  const previewItem = artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     nativeHtml: Boolean(
@@ -1041,7 +1251,12 @@ function openResourceArtifact(
     previewLeaseEligible: nativeArtifact,
     resourceIdentity: workbenchResourceKey(resource.resource),
     sessionKey,
-  }))
+    ...(ownerItem ? { navigationArtifacts: navigationArtifactsFromWorkbenchItem(ownerItem) } : {}),
+  })
+  // Side resources are authorized by the child, but every tab opened from
+  // their preview stays visible in the owning parent's Workbench.
+  const opened = store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
+  if (opened && store.activeItemId === previewItem.id) store.requestReveal()
 }
 
 async function openWorkbenchResource(
@@ -1058,7 +1273,7 @@ async function openWorkbenchResource(
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
-    openResourceArtifact(current.resource, artifact, sessionKey)
+    openResourceArtifact(current.resource, artifact, sessionKey, undefined, 'preview', item)
     return
   }
   if (!current && resource.resource.type === 'document') {
@@ -1066,6 +1281,9 @@ async function openWorkbenchResource(
       resource,
       artifactPayloadFromWorkbenchResource(resource),
       sessionKey,
+      undefined,
+      'preview',
+      item,
     )
     return
   }
@@ -1075,7 +1293,7 @@ async function openWorkbenchResource(
     && resource.capabilities.edit
     && resource.sha256
   ) {
-    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent)
+    await importWorkbenchResourceForSession(resource, sessionKey, isCurrent, item)
     return
   }
   const readonlyResource = current?.resource || resource
@@ -1104,6 +1322,9 @@ async function openWorkbenchResource(
       readonlyResource,
       artifactPayloadFromWorkbenchResource(readonlyResource),
       sessionKey,
+      undefined,
+      'preview',
+      item,
     )
     return
   }
@@ -1115,6 +1336,8 @@ async function openWorkbenchResource(
     artifactPayloadFromWorkbenchResource(resolved),
     sessionKey,
     resolved.resource.type === 'document' ? undefined : preview?.preview,
+    'preview',
+    item,
   )
 }
 
@@ -1122,6 +1345,7 @@ async function importWorkbenchResourceForSession(
   resource: WorkbenchResource,
   sessionKey: string,
   isCurrent: () => boolean = () => true,
+  ownerItem?: WorkbenchItem,
 ) {
   if (!isCurrent()) return
   const imported = await workbenchResources.importDocument(sessionKey, resource)
@@ -1154,7 +1378,7 @@ async function importWorkbenchResourceForSession(
       headArtifactId: imported.revision.artifactId,
       source: resource.resource,
     },
-  }, artifact, sessionKey)
+  }, artifact, sessionKey, undefined, 'preview', ownerItem)
 }
 
 async function publishWorkbenchResource(
@@ -1217,12 +1441,13 @@ async function downloadWorkbenchResource(
 
 function refreshResourceCollectionItem(sessionKey: string) {
   const itemId = resourceCollectionWorkbenchItemId(sessionKey)
-  if (!store.items.some(item => item.id === itemId)) return
-  store.updateItem(createResourceCollectionWorkbenchItem({
-    resources: workbenchResources.navigationResources(sessionKey),
-    sessionKey,
-    title: t('workbench.resources.title'),
-  }))
+  const existing = store.items.find(item => item.id === itemId)
+  if (!existing) return
+  store.updateItem(refreshResourceCollectionWorkbenchItem(
+    existing,
+    workbenchResources.navigationResources(sessionKey),
+    t('workbench.resources.title'),
+  ))
 }
 
 async function refreshArtifactDocumentItem(
@@ -1284,6 +1509,7 @@ function panelRenderState(
 ): WorkbenchPanelRenderState {
   return {
     active,
+    visible: active && store.isVisible,
     hostAvailable: store.hostAvailable,
     nativeSurface,
     runtimeState: runtimeManager.getRenderState(item.id),
@@ -1335,12 +1561,13 @@ async function selectNavigationArtifact(
   select.value = item.id
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
+  const visibleSessionKey = item.scope.type === 'session' ? item.scope.id : ''
   const navigationGeneration = ++artifactNavigationGeneration
   const scopeGeneration = scopeChangeGeneration
   const isCurrent = () => navigationGeneration === artifactNavigationGeneration
     && scopeGeneration === scopeChangeGeneration
-    && props.routeActive && props.sessionId === sessionKey
-    && store.activeSessionId === sessionKey && store.activeItemId === item.id
+    && props.routeActive && props.sessionId === visibleSessionKey
+    && store.activeSessionId === visibleSessionKey && store.activeItemId === item.id
     && store.items.some(candidate => candidate.id === item.id)
   if (!isCurrent()) return
   const kind = artifactWorkbenchPreviewKind(artifact)
@@ -1370,7 +1597,7 @@ async function selectNavigationArtifact(
     }
   }
   if (!isCurrent()) return
-  store.openItem(artifactPreviewItemForExplicitOpen({
+  const previewItem = artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -1378,7 +1605,10 @@ async function selectNavigationArtifact(
       && platform.workbench.native,
     ),
     sessionKey,
-  }))
+  })
+  if (store.openItem({ ...previewItem, scope: item.scope }) && store.activeItemId === previewItem.id) {
+    store.requestReveal()
+  }
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {
@@ -1425,6 +1655,11 @@ function isActiveAnnotationToolbarItem(toolbarItem: WorkbenchToolbarItem): boole
 }
 
 function setPanelHandle(item: WorkbenchItem, value: unknown) {
+  if (item.kind === 'assistant-chat') {
+    if (value && typeof (value as SideChatLaunchHandle).launchSideChat === 'function') {
+      sideChatHandles.set(item.id, value as SideChatLaunchHandle)
+    } else sideChatHandles.delete(item.id)
+  }
   runtimeManager.setComponentHandle(item, value)
 }
 
@@ -1485,16 +1720,24 @@ function performPanelSelection(
 
 function restoreWorkbenchFocus() {
   void nextTick(() => {
-    const candidates = document.querySelectorAll<HTMLElement>([
+    // Query in preference order: a combined selector sorts by DOM position,
+    // which lets an earlier Deliverables button steal the pane toggle's focus.
+    const selectors = [
       '[data-testid="topbar-workbench-toggle"]',
       '[data-testid="chat-session-action-workbench"]',
       '[data-testid="chat-header-primary-action"][data-action="workbench"]',
       '[data-testid="chat-session-action-deliverables"]',
       '[data-testid="chat-header-primary-action"][data-action="deliverables"]',
       '.chat-textarea',
-    ].join(','))
-    const target = [...candidates].find(element => element.getClientRects().length > 0)
-    target?.focus({ preventScroll: true })
+    ]
+    for (const selector of selectors) {
+      const target = [...document.querySelectorAll<HTMLElement>(selector)].find(element =>
+        element.getClientRects().length > 0 && !element.closest('[inert], [aria-hidden="true"]')
+        && !element.matches(':disabled'))
+      if (!target) continue
+      target.focus({ preventScroll: true })
+      return
+    }
   })
 }
 
@@ -1591,10 +1834,11 @@ async function activatePromptAnnotationItem(
 ) {
   detail.acknowledge?.()
   const item = promptAnnotationItem(detail)
-  if (!item) return null
+  if (!item || (item.scope.type === 'session' && item.scope.id !== store.activeSessionId)) return null
+  if (!store.activateItem(item.id) || store.activeItemId !== item.id) return null
   artifactPromptAnnotations.setActiveDocument(detail.sessionKey, detail.documentId)
-  store.activateItem(item.id)
   store.setExpanded(true)
+  store.requestReveal()
   await nextTick()
   await runtimeManager.flush(item.id)
   for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -1760,6 +2004,17 @@ async function beforeCloseItem(
   item: WorkbenchItem,
   options?: WorkbenchBeforeCloseOptions,
 ): Promise<boolean> {
+  if (item.kind === 'assistant-chat' && item.scope.type === 'session') {
+    if (!assistantSessionLifecycle || !gateway?.deliveryIdentity) return false
+    try {
+      await closeAssistantChatOwner({ identity: gateway.deliveryIdentity, parentKey: item.scope.id,
+        ownerId: String(item.payload.ownerId || item.id), lifecycle: assistantSessionLifecycle })
+      return true
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : t('workbench.assistantChat.unavailable'), { tone: 'danger', duration: 9000 })
+      return false
+    }
+  }
   const nativeClose = await requestNativeBrowserClose(item, nativeApi)
   if (nativeClose !== null) return nativeClose
   const accepted = await runtimeManager.beforeClose(item, options)
@@ -1772,21 +2027,12 @@ async function beforeCloseItem(
   return accepted
 }
 
-async function setSessionScopeSafely(sessionId: string | null) {
-  const generation = ++scopeChangeGeneration
-  const previousSessionId = store.activeSessionId
-  if (previousSessionId === sessionId) return
-  const staleItems = store.items.filter(item =>
-    item.scope.type === 'session' && item.scope.id !== sessionId && item.kind !== 'browser')
-  for (const item of staleItems) {
-    if (!await beforeCloseItem(item) || generation !== scopeChangeGeneration) return
-  }
-  if (generation !== scopeChangeGeneration) return
+function setSessionScopeSafely(sessionId: string | null) {
+  if (store.activeSessionId === sessionId) return
+  scopeChangeGeneration += 1
+  // A scope switch is a presentation transaction, not a close transaction.
+  // Retained items still own their document/resource snapshots and authorization.
   store.setSessionScope(sessionId)
-  if (previousSessionId) {
-    artifactDocuments.clearSession(previousSessionId)
-    workbenchResources.clearSession(previousSessionId)
-  }
   if (props.workbenchResourcesEnabled && sessionId) {
     void workbenchResources.load(sessionId, true).then(() => {
       refreshResourceCollectionItem(sessionId)
@@ -1848,6 +2094,10 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  releaseSideChatLauncher?.()
+  sideChatHandles.clear()
+  sideChatLaunchItems.clear()
+  panelOpeningGeneration += 1
   document.removeEventListener('pointerdown', onNewPanelOutside, true)
   window.removeEventListener('resize', onNewPanelViewportChange)
   window.removeEventListener('scroll', onNewPanelViewportChange, true)
@@ -1856,6 +2106,7 @@ onBeforeUnmount(() => {
   nativeArtifactSnapshots.clear()
   artifactNavigationGeneration += 1
   stopPromptAnnotationLifecycle()
+  stopAdmissionNotifications()
   pageAnnotationSendQueue.clear()
   if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
   pageAnnotationSendRetryTimer = null
@@ -2015,18 +2266,23 @@ onBeforeUnmount(() => {
 .app-workbench__start-options {
   display: grid;
   width: 100%;
-  max-width: 520px;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
-  gap: var(--sp-2);
+  max-width: 380px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-3);
 }
 
 .app-workbench__start-option {
-  min-height: 76px;
+  min-height: 68px;
   align-items: center;
   padding: var(--sp-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-surface);
+}
+
+.app-workbench__start-option .app-workbench__new-panel-option-copy {
+  /* Fit the label and one-line pending hint inside the same 68px card. */
+  line-height: 1.4;
 }
 
 .app-workbench__switcher {

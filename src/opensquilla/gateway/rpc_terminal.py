@@ -15,7 +15,8 @@ from opensquilla.gateway.terminal_sessions import (
     _dimension,
     get_terminal_manager,
 )
-from opensquilla.gateway.workspace_files import WorkspaceFiles, WorkspaceFileUnavailableError
+from opensquilla.gateway.terminal_targets import TerminalTargetResolver, parse_terminal_target
+from opensquilla.gateway.workspace_files import WorkspaceFileUnavailableError
 from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
 
 _d = get_dispatcher()
@@ -54,9 +55,13 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
             "INVALID_REQUEST", "Interactive terminals require a WebSocket connection"
         )
     values = _params(params)
-    session_key = values.get("sessionKey", values.get("key"))
-    if not isinstance(session_key, str) or not session_key.strip():
-        raise RpcHandlerError("INVALID_REQUEST", "sessionKey is required")
+    output_flow_control = values.get("outputFlowControl")
+    if output_flow_control not in (None, "consumed-v1"):
+        raise RpcHandlerError("INVALID_REQUEST", "outputFlowControl is not supported")
+    try:
+        target = parse_terminal_target(values)
+    except ValueError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
     cwd = values.get("cwd", "")
     if cwd is None:
         cwd = ""
@@ -80,15 +85,17 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
         command = values.get("command", values.get("shell"))
         if command is not None:
             command = _command(command)
-        service = WorkspaceFiles(ctx.config, ctx.session_manager)
+        service = TerminalTargetResolver(ctx.config, ctx.session_manager, target)
         result = await _MANAGER.create(
             conn_id=ctx.conn_id,
-            session_key=session_key,
+            session_key=target.session_key,
             workspace_service=service,
+            target=target.payload(),
             cwd=cwd,
             command=command,
             cols=cols,
             rows=rows,
+            output_flow_control=output_flow_control == "consumed-v1",
         )
         from opensquilla.gateway.websocket import get_registry
 
@@ -109,7 +116,7 @@ async def _handle_terminal_create(params: dict | None, ctx: RpcContext) -> dict[
     except WorkspaceFileUnavailableError as exc:
         raise RpcHandlerError(
             "WORKSPACE_UNAVAILABLE",
-            "The session workspace is unavailable",
+            "The terminal working directory is unavailable",
             accepted=False,
         ) from exc
     except (ValueError, OSError) as exc:
@@ -172,16 +179,32 @@ async def _handle_terminal_close(params: dict | None, ctx: RpcContext) -> dict[s
         raise _error(exc) from exc
 
 
+async def _handle_terminal_consume(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    _require_host_execute(ctx)
+    values = _params(params)
+    terminal_id = values.get("terminalId")
+    if not isinstance(terminal_id, str) or not terminal_id:
+        raise RpcHandlerError("INVALID_REQUEST", "terminalId is required")
+    try:
+        return await _MANAGER.consume(
+            terminal_id=terminal_id, conn_id=ctx.conn_id, seq=values.get("seq")
+        )
+    except TerminalSessionError as exc:
+        raise _error(exc) from exc
+
+
 _d.register("terminal.create", _handle_terminal_create, "operator.write")
 _d.register("terminal.write", _handle_terminal_write, "operator.write")
 _d.register("terminal.resize", _handle_terminal_resize, "operator.write")
 _d.register("terminal.close", _handle_terminal_close, "operator.write")
+_d.register("terminal.consume", _handle_terminal_consume, "operator.write")
 
 
 __all__ = [
     "_MANAGER",
     "_handle_terminal_close",
     "_handle_terminal_create",
+    "_handle_terminal_consume",
     "_handle_terminal_resize",
     "_handle_terminal_write",
 ]

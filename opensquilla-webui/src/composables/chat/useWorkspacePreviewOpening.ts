@@ -15,10 +15,11 @@ export function useWorkspacePreviewOpening(options: {
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   enabled: Ref<boolean>
+  beginRequest?: () => () => boolean
   getArtifact: (key: string, artifactId: string) => Promise<ArtifactPayload | null>
   resolve: (key: string, ref: WorkbenchResourceRef) => Promise<WorkbenchResource | null>
   openCurrent: (key: string, resource: WorkbenchResource) => Promise<WorkbenchResourceOpenResponse | null>
-  show: (current: CurrentDocument, key: string, previewPagePath?: string) => void
+  show: (current: CurrentDocument, key: string, previewPagePath?: string) => boolean | void
   onError: (error: unknown) => void
 }) {
   let lifetime = 0
@@ -36,7 +37,10 @@ export function useWorkspacePreviewOpening(options: {
     const started = lifetime
     if (disposed || !key || expectedSessionKey !== key) return
     const request = ++openRequest
-    const isCurrent = () => lifetime === started && options.sessionKey.value === key && request === openRequest
+    const ownerIsCurrent = options.beginRequest?.() ?? (() => true)
+    const isCurrent = () => lifetime === started && options.sessionKey.value === key
+      && request === openRequest && ownerIsCurrent()
+    if (!isCurrent()) return
     const hasPage = (resource: WorkbenchResource) => previewPagePath === undefined
       || (isPreviewPagePath(previewPagePath) && resource.previewPages?.includes(previewPagePath))
     try {
@@ -75,8 +79,10 @@ export function useWorkspacePreviewOpening(options: {
         || !current.resource.capabilities.preview || !hasPage(current.resource)) {
         throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
       }
-      if (previewPagePath === undefined) options.show(current, key)
-      else options.show(current, key, previewPagePath)
+      const shown = previewPagePath === undefined
+        ? options.show(current, key)
+        : options.show(current, key, previewPagePath)
+      return shown !== false
     } catch (error) {
       if (isCurrent()) options.onError(error)
     }

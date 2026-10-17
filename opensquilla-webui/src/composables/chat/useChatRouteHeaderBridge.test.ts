@@ -62,6 +62,51 @@ function owner(title: string): {
 }
 
 describe('chat route header bridge', () => {
+  it('requires a durable session or an explicit preparation command before opening a panel', async () => {
+    const bridge = createBridge()
+    const draft = owner('draft')
+    const durable = ref(false)
+    draft.model.sessionDurable = durable
+    bridge.register(draft.model, draft.commands)
+    expect(bridge.model.sessionDurable.value).toBe(false)
+    expect(await bridge.prepareWorkbenchSession('session-draft')).toBeNull()
+    durable.value = true
+    expect(await bridge.prepareWorkbenchSession('session-draft')).toBe('session-draft')
+    expect(await bridge.prepareWorkbenchSession('stale-session')).toBeNull()
+  })
+
+  it('prepares a hidden draft without treating header visibility as session availability', async () => {
+    const bridge = createBridge()
+    const draft = owner('draft')
+    const durable = ref(false)
+    draft.model.visible = ref(false)
+    draft.model.sessionDurable = durable
+    draft.commands.prepareWorkbenchSession = vi.fn(async key => {
+      durable.value = true
+      return key
+    })
+    bridge.register(draft.model, draft.commands)
+    expect(await bridge.prepareWorkbenchSession('stale-session')).toBeNull()
+    expect(draft.commands.prepareWorkbenchSession).not.toHaveBeenCalled()
+    expect(await bridge.prepareWorkbenchSession('session-draft')).toBe('session-draft')
+    expect(draft.commands.prepareWorkbenchSession).toHaveBeenCalledExactlyOnceWith('session-draft')
+  })
+
+  it('discards a completed preparation after the route owner is replaced', async () => {
+    const bridge = createBridge()
+    const first = owner('first')
+    first.model.sessionDurable = ref(true)
+    let finish!: (key: string) => void
+    first.commands.prepareWorkbenchSession = () => new Promise(resolve => { finish = resolve })
+    bridge.register(first.model, first.commands)
+    const pending = bridge.prepareWorkbenchSession('session-first')
+    const replacement = owner('first')
+    replacement.model.sessionDurable = ref(true)
+    bridge.register(replacement.model, replacement.commands)
+    finish('session-first')
+    expect(await pending).toBeNull()
+  })
+
   it('fences workspace panel availability to the current registered session', () => {
     const bridge = createBridge()
     const project = owner('project')
@@ -78,6 +123,24 @@ describe('chat route header bridge', () => {
     expect(bridge.model.workspaceId.value).toBeNull()
     expect(bridge.model.workspaceReady.value).toBe(false)
     expect(bridge.model.workspaceResolved.value).toBe(false)
+  })
+
+  it('projects loading only from the active route owner', () => {
+    const bridge = createBridge()
+    const first = owner('first')
+    const loading = ref(true)
+    first.model.sessionLoading = loading
+    const stale = bridge.register(first.model, first.commands)
+    expect(bridge.model.sessionLoading.value).toBe(true)
+    loading.value = false
+    expect(bridge.model.sessionLoading.value).toBe(false)
+    const replacement = owner('replacement')
+    replacement.model.sessionLoading = ref(true)
+    bridge.register(replacement.model, replacement.commands)
+    expect(stale.release()).toBe(false)
+    expect(bridge.model.sessionLoading.value).toBe(true)
+    bridge.clear()
+    expect(bridge.model.sessionLoading.value).toBe(false)
   })
 
   it('keeps optional find capability absent for existing header owners', () => {

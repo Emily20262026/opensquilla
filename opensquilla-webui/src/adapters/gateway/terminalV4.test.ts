@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createV4TerminalAccess } from './terminalV4'
+import type { TerminalTarget } from '@/modules/terminal'
 
 function fixture() {
   const rpc = {
@@ -25,6 +26,54 @@ function fixture() {
 }
 
 describe('terminal Gateway adapter', () => {
+  it('negotiates parser consumption credits and validates their response', async () => {
+    const h = fixture()
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'pty-1', sessionKey: 'session-a', cols: 80, rows: 24, shell: 'bash', outputFlowControl: 'consumed-v1' })
+    await expect(h.access.create('session-a', { outputFlowControl: 'consumed-v1' })).resolves.toMatchObject({ outputFlowControl: 'consumed-v1' })
+    expect(h.rpc.request.mock.calls[0]?.[1]).toMatchObject({ outputFlowControl: 'consumed-v1' })
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'pty-1', consumedSeq: 9 })
+    await expect(h.access.consume!('pty-1', 9)).resolves.toEqual({ terminalId: 'pty-1', consumedSeq: 9 })
+    expect(h.rpc.request.mock.calls[1]?.slice(0, 2)).toEqual(['terminal.consume', { terminalId: 'pty-1', seq: 9 }])
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'other', consumedSeq: 10 })
+    await expect(h.access.consume!('pty-1', 10)).rejects.toThrow('invalid response')
+    await expect(h.access.consume!('pty-1', 0)).rejects.toThrow('invalid terminal.consume')
+  })
+
+  it.each<TerminalTarget>([
+    { kind: 'default-agent', agentId: 'main' },
+    { kind: 'project', workspaceId: 'project-a' },
+    { kind: 'session', sessionKey: 'session-a' },
+  ])('creates a typed $kind target without synthesizing a session key', async target => {
+    const h = fixture()
+    h.rpc.request.mockResolvedValueOnce({ terminalId: 'pty-target', target, cwdPath: 'C:\\work\\project', cols: 80, rows: 24, shell: 'pwsh' })
+    await expect(h.access.create(target, { cols: 80, rows: 24 })).resolves.toEqual({
+      terminalId: 'pty-target', target, cwdPath: 'C:\\work\\project', cols: 80, rows: 24, shell: 'pwsh',
+    })
+    expect(h.rpc.request.mock.calls[0]?.[1]).toEqual({ target, cols: 80, rows: 24 })
+    expect(h.rpc.request.mock.calls[0]?.[1]).not.toHaveProperty('sessionKey')
+  })
+
+  it('rejects empty target identifiers before making an RPC', async () => {
+    const h = fixture()
+    await expect(h.access.create({ kind: 'project', workspaceId: ' ' })).rejects.toThrow('valid terminal target')
+    await expect(h.access.create(' ')).rejects.toThrow('valid terminal target')
+    expect(h.rpc.ready).not.toHaveBeenCalled()
+    expect(h.rpc.request).not.toHaveBeenCalled()
+  })
+
+  it('projects target-tagged output and drops malformed targets', () => {
+    const h = fixture()
+    const output = vi.fn()
+    const exit = vi.fn()
+    h.access.onOutput(output); h.access.onExit(exit)
+    const target = { kind: 'default-agent', agentId: 'main' }
+    h.handlers.get('terminal.output')?.({ terminalId: 'pty-1', target, seq: 1, data: 'prompt', encoding: 'utf8' })
+    h.handlers.get('terminal.output')?.({ terminalId: 'pty-1', target: { kind: 'project', workspaceId: '' }, seq: 2, data: 'bad' })
+    h.handlers.get('terminal.exit')?.({ terminalId: 'pty-1', target, seq: 3, exitCode: 0, signal: null, reason: null })
+    expect(output).toHaveBeenCalledExactlyOnceWith({ terminalId: 'pty-1', target, seq: 1, data: 'prompt', encoding: 'utf8' })
+    expect(exit).toHaveBeenCalledExactlyOnceWith({ terminalId: 'pty-1', target, seq: 3, exitCode: 0, signal: null, reason: null })
+  })
+
   it('uses the shared RPC transport for create/write/resize/close', async () => {
     const h = fixture()
     const signal = new AbortController().signal

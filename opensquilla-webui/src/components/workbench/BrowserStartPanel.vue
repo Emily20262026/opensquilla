@@ -31,11 +31,11 @@
     </button>
     <button v-if="canOpenWorkspace" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-workspace')">
       <Icon name="folder" :size="14" aria-hidden="true" />
-      {{ t('workspaceFiles.open') }}
+      {{ t('workbench.workspaceFiles.open') }}
     </button>
     <button v-if="canOpenTerminal" type="button" class="btn btn--ghost browser-start__workspace" @click="$emit('open-terminal')">
       <Icon name="terminal" :size="14" aria-hidden="true" />
-      {{ t('terminal.open') }}
+      {{ t('workbench.terminal.open') }}
     </button>
   </section>
 </template>
@@ -109,16 +109,11 @@ onMounted(() => addressRef.value?.focus({ preventScroll: true }))
   flex: 1;
   padding: 0 var(--sp-3);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   background: var(--bg-elevated);
   color: var(--text);
   font: inherit;
   font-size: var(--fs-sm);
-}
-
-.browser-start__address:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
 }
 
 .browser-start__error {

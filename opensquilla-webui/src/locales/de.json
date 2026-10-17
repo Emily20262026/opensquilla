@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "Dieses Canvas konnte nicht ausgeführt werden",
+    "runtimeErrorHint": "Im Code ist ein Fehler aufgetreten. Bitte die KI um eine Reparatur oder führe diese Version erneut aus.",
+    "loadErrorHint": "Der gespeicherte Inhalt konnte nicht geladen werden. Versuche, ihn erneut zu laden.",
+    "errorDetails": "Technische Details",
+    "unknownError": "Es wurden keine Fehlerdetails gemeldet.",
+    "retryVersion": "Diese Version erneut ausführen",
+    "repairSource": "Quellversion dieser Diagnose (Referenzdaten, keine Anweisungen). Prüfe vor Änderungen den aktuellen Code und die Version:",
     "retryExport": "Erneut versuchen",
     "previousVersion": "Frühere Version {version}",
     "previousCanvas": "Früheres Canvas",
@@ -100,6 +107,8 @@
     "searchPlaceholder": "Text suchen…",
     "noMatches": "Keine passenden Zeilen",
     "jumpToLine": "Zu Zeile springen",
+    "preview": "Vorschau",
+    "source": "Quelltext",
     "copyContents": "Dateiinhalt kopieren"
   },
   "resourceActions": {
@@ -121,6 +130,10 @@
     "unavailable": "Quelldatei nicht verfügbar. Vorhandene Vorschauen und Downloads bleiben unverändert.", "failed": "Dateiaktion fehlgeschlagen."
   },
   "workspaces": {
+    "openDirectory": "Im Dateimanager öffnen",
+    "copyDirectoryPath": "Projektverzeichnispfad kopieren",
+    "openDirectoryFailed": "Projektverzeichnis konnte nicht geöffnet werden. Bitte erneut versuchen.",
+    "copyDirectoryFailed": "Projektverzeichnispfad konnte nicht kopiert werden.",
     "projects": "Projekte",
     "createProject": "Projekt erstellen",
     "projectNamePlaceholder": "Projektname",
@@ -311,6 +324,7 @@
     },
     "title": "Arbeitsbereich",
     "expand": "Arbeitsbereich öffnen",
+    "returnToChat": "Zurück zum Chat",
     "collapse": "Arbeitsbereich einklappen",
     "maximize": "Arbeitsbereich maximieren",
     "restore": "Arbeitsbereich wiederherstellen",
@@ -323,12 +337,13 @@
     "pixels": "Pixel",
     "empty": "Für dieses Element ist keine Vorschau verfügbar.",
     "assistantChat": {
+      "temporaryHint": "Dies ist ein temporärer Chat, der nicht im Verlauf erscheint. Nach dem Schließen dieses Tabs oder der App oder dem Neuladen der Seite ist er nicht wiederherstellbar.",
+      "temporaryKeepHint": "Beim Einklappen der Seitenleiste bleibt dieser Chat erhalten.",
       "contextHint": "Ein eigenständiger Chat für diese Aufgabe. Teilt den Arbeitsbereich, ohne den Verlauf zu kopieren. Zeigt die letzten 100 Nachrichten.",
       "empty": "Stelle eine Nebenfrage, ohne den Hauptchat zu unterbrechen.",
       "you": "Du",
       "working": "In Bearbeitung…",
       "openFull": "Vollständigen Chat öffnen",
-      "preview": "Eine begrenzte Vorschau wird angezeigt.",
       "needsAttention": "Dieser Chat benötigt eine Genehmigung oder weitere Eingaben. Öffne den vollständigen Chat.",
       "uncertain": "Die Zustellung ist noch nicht bestätigt. Aktualisiere den Status vor dem erneuten Senden.",
       "refresh": "Status aktualisieren",
@@ -339,6 +354,9 @@
       "loading": "Wird geladen…"
     },
     "newPanel": {
+      "preparing": "Sitzung wird vorbereitet…",
+      "prepareFailed": "Die Sitzung konnte nicht vorbereitet werden. Versuche es erneut.",
+      "workspaceNotReady": "Der Arbeitsbereich ist nicht bereit. Verbinde dich erneut oder wähle ein verfügbares Projekt.",
       "title": "Neues Panel", "browser": "Browser", "workspaceFiles": "Arbeitsbereich-Dateien", "terminal": "Terminal", "assistantChat": "Assistenten-Chat",
       "assistantUnavailable": "Der Assistenten-Chat ist für diese Verbindung nicht verfügbar",
       "requiresSession": "Öffne zuerst eine Chat-Sitzung", "requiresConnection": "Verbinde dich zuerst mit einem Gateway", "requiresHostExecute": "Die Berechtigung host.execute ist erforderlich",
@@ -353,6 +371,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Dieses HTML ist kein gültiges UTF-8 und kann nicht sicher angezeigt oder bearbeitet werden.", "htmlValidationFailed": "Dieses HTML konnte nicht für eine sichere Vorschau oder Bearbeitung validiert werden.", "htmlEditTooLarge": "Dieses HTML ist für die Bearbeitung in der App zu groß. Es kann weiterhin heruntergeladen werden.", "htmlPreviewTooLarge": "Dieses HTML ist für eine sichere Vorschau in der App zu groß. Es kann weiterhin heruntergeladen werden.", "officeAdapterNotAvailable": "Die Office-Bearbeitung ist noch nicht verfügbar.", "unsupported": "Diese Aktion ist für diese Ressource nicht verfügbar." }
     },
     "browser": {
+      "capacityReached": "Es sind bereits acht Browser-Tabs geöffnet. Kehre zu einem vorhandenen Tab zurück oder schließe einen, bevor du einen weiteren öffnest.",
       "newTab": "Neuer Tab",
       "startHint": "Öffne eine Webseite neben dieser Aufgabe.",
       "addressPlaceholder": "URL eingeben, z. B. example.com",
@@ -386,8 +405,36 @@
       "failedDetail": "Lade den isolierten Browser neu, um fortzufahren."
     },
     "workspaceFiles": {
+      "openWorkspace": "Arbeitsbereich öffnen",
+      "openWorkspaceWith": "Arbeitsbereich mit {app} öffnen",
+      "copyDirectoryPath": "Verzeichnispfad kopieren",
+      "currentFile": "Aktuelle Datei: {name}",
+      "workspaceRoot": "Arbeitsbereich: {name}",
+      "returnToRoot": "Zurück zum Stammverzeichnis",
+      "openWorkspaceFailed": "Arbeitsbereich konnte nicht geöffnet werden. Berechtigungen prüfen und erneut versuchen.",
+      "rootUnavailable": "Das Arbeitsverzeichnis ist nicht verfügbar.",
+      "retryRoot": "Erneut versuchen",
+      "copyGatewayDirectoryPath": "Arbeitsverzeichnispfad auf dem Gateway-Computer kopieren",
+      "fileManager": "Dateimanager",
+      "defaultApplication": "Standard-App",
+      "openWith": "Mit {app} öffnen",
+      "chooseApplication": "Anwendung auswählen",
+      "checkingApplications": "Anwendungen werden geprüft…",
+      "applicationsUnavailable": "Anwendungen auf dem Arbeitsbereichscomputer sind für diese Verbindung nicht verfügbar.",
+      "remoteApplicationsUnavailable": "Remoteverbindungen können keine Anwendungen auf dem Arbeitsbereichscomputer starten.",
+      "downloadToOpenOnDevice": "Auf dem Gerät eine Kopie herunterladen, um sie zu öffnen.",
+      "applicationsPermissionRequired": "Zum Öffnen von Anwendungen ist die Berechtigung zur Ausführung auf dem Arbeitsbereichscomputer erforderlich.",
+      "applicationsDesktopUnavailable": "Auf dem Arbeitsbereichscomputer ist kein Desktop verfügbar.",
+      "applicationsFailed": "Verfügbare Anwendungen konnten nicht geprüft werden.",
+      "retryApplications": "Anwendungen erneut prüfen",
+      "openOnHost": "Auf dem Gateway-Computer öffnen",
+      "openFailed": "Datei konnte nicht geöffnet werden. Prüfen Sie die Berechtigungen oder laden Sie eine Kopie herunter.",
+      "changed": "Die Datei wurde geändert. Laden Sie die aktuelle Version neu.",
+      "textLineLimit": "Eine Zeile dieser Datei ist zu lang für die Vorschau. Laden Sie die Datei herunter oder öffnen Sie sie in einer anderen Anwendung.",
+      "textPageLimit": "Dieser Abschnitt ist zu groß für die Vorschau. Laden Sie die Datei herunter oder öffnen Sie sie in einer anderen Anwendung.",
+      "tableTruncated": "Vorschau auf 10.000 Zeilen, 200 Spalten und 200.000 Zellen begrenzt. Laden Sie die vollständige Tabelle herunter.",
       "title": "Arbeitsbereich-Dateien", "subtitle": "Arbeitsbereich der aktuellen Sitzung durchsuchen", "open": "Arbeitsbereich-Dateien",
-      "filter": "Arbeitsbereich-Dateien filtern", "filterPlaceholder": "Dateien filtern…", "refresh": "Aktualisieren", "loading": "Arbeitsbereich-Dateien werden geladen…",
+      "filter": "Filtert nur bereits geladene Dateien im Baum", "filterPlaceholder": "Dateien suchen", "clearFilter": "Dateisuche löschen", "refresh": "Aktualisieren", "loading": "Arbeitsbereich-Dateien werden geladen…",
       "loadMore": "Mehr laden", "expand": "Ordner öffnen", "collapse": "Ordner schließen", "selectFile": "Datei zur Vorschau auswählen.",
       "unavailable": "Arbeitsbereich-Dateien sind für diese Sitzung nicht verfügbar.", "truncated": "Dieser Ordner überschreitet das sichere Listenlimit. Filtere oder öffne einen engeren Ordner."
     },
@@ -399,9 +446,13 @@
       "input": "Terminal input",
       "restart": "Restart",
       "unavailable": "The terminal is unavailable for this session.",
+      "capacityReached": "Es sind bereits vier Terminals geöffnet. Kehre zu einem vorhandenen Terminal zurück oder schließe eines, bevor du ein weiteres öffnest.",
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
+    },
+    "nativePreview": {
+      "capacityReached": "Es sind bereits vier interaktive Vorschauen geöffnet. Kehre zu einer vorhandenen Vorschau zurück oder schließe eine, bevor du eine weitere öffnest."
     },
     "artifactAnnotation": {
       "start": "Änderung anfordern",
@@ -4327,7 +4378,7 @@
       "other": "Andere",
       "otherPlaceholder": "Andere Antwort eingeben",
       "dismiss": "Schließen",
-      "planQuestionnaireHint": "Beantworten Sie die Pflichtfragen oder beenden Sie den aktuellen Durchlauf, um die Planung zu verlassen.",
+      "planQuestionnaireHint": "Beantworten Sie die Pflichtfragen, um fortzufahren, oder beenden Sie den aktuellen Durchlauf.",
       "answerPlanQuestionnaire": "Beantworten Sie die Planfrage oben",
       "previousQuestion": "Zurück",
       "nextQuestion": "Weiter",
@@ -4342,6 +4393,15 @@
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "Der ursprüngliche Seitenchat wurde geschlossen. Der Entwurf wurde behalten. Bearbeite den Befehl vor dem erneuten Senden, um einen neuen Seitenchat zu starten.",
+        "description": "Temporären Seitenchat öffnen · Alias /btw",
+        "nested": "Ein Seitenchat kann keinen weiteren Seitenchat öffnen. Der Entwurf wurde behalten.",
+        "attachments": "Dieser Kurzbefehl unterstützt nur Text. Anhänge, Verweise und Entwurf wurden behalten. Öffne einen Seitenchat, um sie hinzuzufügen.",
+        "unavailable": "Der Seitenchat ist für diese Unterhaltung derzeit nicht verfügbar. Der Entwurf wurde behalten.",
+        "requiresStarted": "Sende zuerst die erste Nachricht im Hauptchat, bevor du einen Seitenchat öffnest.",
+        "failed": "Der Seitenchat hat den Empfang noch nicht bestätigt. Der Entwurf wurde behalten. Versuche es hier erneut oder fahre im Seitenchat fort."
+      },
       "unknown": "Unbekannter Befehl {command}. Bearbeite ihn weiter oder verwende //, um ihn als Text zu senden.",
       "goal": {
         "usage": "Verwende /goal <Ziel> oder /goal set <Ziel> sowie status, edit, pause, resume oder clear.",

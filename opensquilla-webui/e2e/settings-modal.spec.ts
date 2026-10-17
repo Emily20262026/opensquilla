@@ -149,9 +149,13 @@ test.describe('Settings modal', () => {
       aboveModal: true,
     })
 
+    // A notification must not cover the modal's close control. Keep it visible
+    // while clicking Close; the body portal must survive the modal unmount.
+    await dialog(page).getByRole('button', { name: 'Close', exact: true }).click()
+    await expect(dialog(page)).toBeHidden()
+    await expect(toast).toBeVisible()
     await toast.getByRole('button', { name: 'Dismiss notification' }).click()
     await expect(toast).toHaveCount(0)
-    await expect(dialog(page)).toBeVisible()
   })
 
   test('rail switches sections, marks the active tab, and syncs the URL with replace', async ({ page }) => {
@@ -637,7 +641,9 @@ test.describe('Settings modal', () => {
     const expanded = dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })
     await expect(collapsed).toBeChecked()
 
-    await expanded.click()
+    // The native input is a focusable 1px radio; its visible label is the
+    // pointer target, while checked-state assertions stay on the real input.
+    await expanded.locator('..').click()
     await expect(expanded).toBeChecked()
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
     expect(await page.evaluate(() => (
@@ -649,7 +655,7 @@ test.describe('Settings modal', () => {
     await expect(dialog(page)).toBeVisible()
     await expect(dialog(page).getByRole('radio', { name: 'Expanded by default', exact: true })).toBeChecked()
 
-    await dialog(page).getByRole('radio', { name: 'Collapsed by default', exact: true }).click()
+    await dialog(page).getByRole('radio', { name: 'Collapsed by default', exact: true }).locator('..').click()
   })
 
   test('Advanced client experiments still apply instantly without a dirty bar', async ({ page }) => {

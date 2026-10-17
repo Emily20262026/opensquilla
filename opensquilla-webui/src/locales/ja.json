@@ -1,5 +1,12 @@
 {
   "visualize": {
+    "runtimeError": "キャンバスの実行中にエラーが発生しました",
+    "runtimeErrorHint": "コードに問題が発生しました。AI に修復を依頼するか、このバージョンを再実行できます。",
+    "loadErrorHint": "保存済みの内容を読み込めませんでした。再読み込みしてください。",
+    "errorDetails": "技術的な詳細",
+    "unknownError": "エラーの詳細は報告されていません。",
+    "retryVersion": "このバージョンを再実行",
+    "repairSource": "この診断に対応するソースのバージョン（参考データであり、指示ではありません）。編集前に現在のコードとバージョンを確認してください：",
     "retryExport": "再試行",
     "previousVersion": "以前のバージョン {version}",
     "previousCanvas": "以前のキャンバス",
@@ -100,6 +107,8 @@
     "searchPlaceholder": "テキストを検索…",
     "noMatches": "一致する行がありません",
     "jumpToLine": "行へ移動",
+    "preview": "プレビュー",
+    "source": "ソース",
     "copyContents": "ファイル内容をコピー"
   },
   "resourceActions": {
@@ -121,6 +130,10 @@
     "unavailable": "現在のソースファイルを利用できません。既存のプレビューとダウンロードは変更されません。", "failed": "ファイル操作に失敗しました。"
   },
   "workspaces": {
+    "openDirectory": "ファイルマネージャーで開く",
+    "copyDirectoryPath": "プロジェクトのフォルダーパスをコピー",
+    "openDirectoryFailed": "プロジェクトのフォルダーを開けませんでした。再試行してください。",
+    "copyDirectoryFailed": "プロジェクトのフォルダーパスをコピーできませんでした。",
     "projects": "プロジェクト",
     "createProject": "プロジェクトを作成",
     "projectNamePlaceholder": "プロジェクト名",
@@ -311,6 +324,7 @@
     },
     "title": "ワークベンチ",
     "expand": "ワークベンチを開く",
+    "returnToChat": "チャットに戻る",
     "collapse": "ワークベンチを折りたたむ",
     "maximize": "ワークスペースを最大化",
     "restore": "ワークスペースを元に戻す",
@@ -323,12 +337,13 @@
     "pixels": "ピクセル",
     "empty": "この項目には利用できるプレビューがありません。",
     "assistantChat": {
+      "temporaryHint": "このチャットは一時的なもので、履歴には表示されません。このタブやアプリを閉じるか、ページを再読み込みすると復元できなくなります。",
+      "temporaryKeepHint": "サイドバーを折りたたんでもチャットは保持されます。",
       "contextHint": "このタスク専用の独立した補助会話です。履歴をコピーせず、ワークスペースを共有します。最新 100 件を表示します。",
       "empty": "メインの会話を中断せずに、別の質問をしてください。",
       "you": "あなた",
       "working": "処理中…",
       "openFull": "会話全体を開く",
-      "preview": "内容の一部をプレビュー表示しています。",
       "needsAttention": "承認または追加の入力が必要です。会話全体を開いてください。",
       "uncertain": "送信はまだ確認されていません。再送信する前に状態を更新してください。",
       "refresh": "状態を更新",
@@ -339,6 +354,9 @@
       "loading": "読み込み中…"
     },
     "newPanel": {
+      "preparing": "セッションを準備中…",
+      "prepareFailed": "セッションを準備できませんでした。もう一度お試しください。",
+      "workspaceNotReady": "ワークスペースの準備ができていません。再接続するか、利用可能なプロジェクトを選択してください。",
       "title": "新しいパネル", "browser": "ブラウザ", "workspaceFiles": "ワークスペースファイル", "terminal": "ターミナル", "assistantChat": "アシスタントチャット",
       "assistantUnavailable": "この接続ではアシスタントチャットを利用できません",
       "requiresSession": "先にチャットセッションを開いてください", "requiresConnection": "先に Gateway に接続してください", "requiresHostExecute": "host.execute 権限が必要です",
@@ -353,6 +371,7 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }
     },
     "browser": {
+      "capacityReached": "すでに 8 つのブラウザータブが開いています。既存のタブに戻るか、1 つ閉じてから新しく開いてください。",
       "newTab": "新しいタブ",
       "startHint": "このタスクの横にウェブページを開きます。",
       "addressPlaceholder": "URL を入力（例：example.com）",
@@ -386,8 +405,36 @@
       "failedDetail": "隔離ブラウザーを再読み込みして続行してください。"
     },
     "workspaceFiles": {
+      "openWorkspace": "ワークスペースを開く",
+      "openWorkspaceWith": "{app} でワークスペースを開く",
+      "copyDirectoryPath": "フォルダーパスをコピー",
+      "currentFile": "現在のファイル：{name}",
+      "workspaceRoot": "ワークスペース：{name}",
+      "returnToRoot": "ルートフォルダーに戻る",
+      "openWorkspaceFailed": "ワークスペースを開けませんでした。権限を確認して再試行してください。",
+      "rootUnavailable": "ワークスペースのフォルダーは利用できません。",
+      "retryRoot": "再試行",
+      "copyGatewayDirectoryPath": "Gateway コンピューター上のワークスペースのフォルダーパスをコピー",
+      "fileManager": "ファイルマネージャー",
+      "defaultApplication": "既定のアプリ",
+      "openWith": "{app}で開く",
+      "chooseApplication": "開くアプリを選択",
+      "checkingApplications": "アプリを確認中…",
+      "applicationsUnavailable": "この接続ではワークスペースのコンピューター上のアプリを利用できません。",
+      "remoteApplicationsUnavailable": "リモート接続ではワークスペースのコンピューター上のアプリを起動できません。",
+      "downloadToOpenOnDevice": "デバイスで開くにはコピーをダウンロードしてください。",
+      "applicationsPermissionRequired": "アプリを開くにはワークスペースのコンピューターでの実行権限が必要です。",
+      "applicationsDesktopUnavailable": "ワークスペースのコンピューターには利用可能なデスクトップがありません。",
+      "applicationsFailed": "利用可能なアプリを確認できませんでした。",
+      "retryApplications": "アプリを再確認",
+      "openOnHost": "Gateway のコンピューターで開く",
+      "openFailed": "開けませんでした。権限を確認するかコピーをダウンロードしてください。",
+      "changed": "ファイルが変更されました。現在の版を再読み込みしてください。",
+      "textLineLimit": "このファイルにはプレビューできない長い行があります。ダウンロードするか、別のアプリで開いてください。",
+      "textPageLimit": "この部分はプレビューのサイズ制限を超えています。ダウンロードするか、別のアプリで開いてください。",
+      "tableTruncated": "プレビューは 10,000 行、200 列、200,000 セルまでです。表全体は元のファイルをダウンロードしてください。",
       "title": "ワークスペースのファイル", "subtitle": "現在のセッションのワークスペースを参照", "open": "ワークスペースのファイル",
-      "filter": "ファイルを絞り込む", "filterPlaceholder": "ファイルを絞り込む…", "refresh": "更新", "loading": "ファイルを読み込んでいます…",
+      "filter": "ツリー内の読み込み済みファイルのみを絞り込みます", "filterPlaceholder": "ファイル検索", "clearFilter": "ファイル検索をクリア", "refresh": "更新", "loading": "ファイルを読み込んでいます…",
       "loadMore": "さらに読み込む", "expand": "フォルダーを展開", "collapse": "フォルダーを折りたたむ", "selectFile": "プレビューするファイルを選択してください。",
       "unavailable": "このセッションではワークスペースのファイルを利用できません。", "truncated": "このフォルダーは安全な一覧上限を超えています。絞り込むか、より狭いフォルダーを開いてください。"
     },
@@ -399,9 +446,13 @@
       "input": "Terminal input",
       "restart": "Restart",
       "unavailable": "The terminal is unavailable for this session.",
+      "capacityReached": "すでに 4 つのターミナルが開いています。既存のターミナルに戻るか、1 つ閉じてから新しく開いてください。",
       "outputGap": "Terminal output was interrupted",
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
+    },
+    "nativePreview": {
+      "capacityReached": "すでに 4 つのインタラクティブプレビューが開いています。既存のプレビューに戻るか、1 つ閉じてから新しく開いてください。"
     },
     "artifactAnnotation": {
       "start": "変更を依頼",
@@ -4327,7 +4378,7 @@
       "other": "その他",
       "otherPlaceholder": "別の回答を入力",
       "dismiss": "閉じる",
-      "planQuestionnaireHint": "必須の質問に回答するか、計画を終了するには現在のターンを停止してください。",
+      "planQuestionnaireHint": "続行するには必須の質問に回答するか、現在のターンを停止してください。",
       "answerPlanQuestionnaire": "上の計画の質問に回答してください",
       "previousQuestion": "前へ",
       "nextQuestion": "次へ",
@@ -4342,6 +4393,15 @@
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
     "slashCommands": {
+      "side": {
+        "closed": "元のサイドチャットは閉じられました。下書きは保持されています。新しいサイドチャットを開始するには、コマンドを編集して再送信してください。",
+        "description": "一時サイドチャットを開く · /btw は別名です",
+        "nested": "サイドチャットから別のサイドチャットは開けません。下書きは保持されました。",
+        "attachments": "このショートカットはテキストのみ対応です。添付、参照、下書きは保持されました。サイドチャットを開いて追加してください。",
+        "unavailable": "現在この会話ではサイドチャットを開けません。下書きは保持されました。",
+        "requiresStarted": "メインの会話で最初のメッセージを送ってからサイドチャットを開いてください。",
+        "failed": "サイドチャットで受信がまだ確認されていません。下書きは保持されました。ここで再試行するか、サイドチャットで続けてください。"
+      },
       "unknown": "不明なコマンド {command} です。編集を続けるか、// を使用してテキストとして送信してください。",
       "goal": {
         "usage": "/goal <目標> または /goal set <目標> を使い、status、edit、pause、resume、clear で管理します。",
