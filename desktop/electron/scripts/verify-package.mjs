@@ -287,6 +287,7 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   const binary = requireGatewayBinary(root, label, platform)
   if (executeCommands) {
     if (!binary) return
+    verifyGatewayCommand(binary, label, ['--_desktop-tool-search-probe'])
     verifyGatewayCommand(binary, label, ['--help'])
     verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-imports'], { timeout: 120000 })
     verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-router'], { timeout: 120000 })

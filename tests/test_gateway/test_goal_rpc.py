@@ -885,12 +885,17 @@ async def test_set_post_accept_notification_failure_still_activates_durable_task
     async def handler(run: TaskRun) -> None:
         runs.append(run)
 
-    async with _open_goal_rpc_stack(
-        tmp_path / "goal-set-notify-failure.sqlite",
-        handler=handler,
-        wire_lifecycle=True,
-        wire_idle=False,
-    ) as stack:
+    # This is a durability contract, not a SQLite latency benchmark. Keep one
+    # deadlock guard around setup, acceptance, settlement, and assertions.
+    async with (
+        asyncio.timeout(60.0),
+        _open_goal_rpc_stack(
+            tmp_path / "goal-set-notify-failure.sqlite",
+            handler=handler,
+            wire_lifecycle=True,
+            wire_idle=False,
+        ) as stack,
+    ):
         def fail_notification(_entry: Any) -> None:
             raise RuntimeError("synthetic post-accept notification failure")
 
@@ -900,15 +905,15 @@ async def test_set_post_accept_notification_failure_still_activates_durable_task
             fail_notification,
         )
         response = await _handle_goals_set(_set_params(), stack.context)
-        task = await stack.runtime.wait(response["taskId"], timeout=2.0)
-        goal = await _wait_for_goal(
-            stack.storage,
-            lambda current: current.active_task_id is None,
-        )
+        task = await stack.runtime.wait(response["taskId"])
+        # Runtime completion includes the ordered Goal settlement callback.
+        goal = await stack.storage.get_goal(SOURCE_KEY)
 
         assert response["accepted"] is True
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert len(runs) == 1
+        assert goal is not None
+        assert goal.active_task_id is None
         assert goal.status == "active"
         assert goal.turns_started == 1
         assert goal.turns_settled == 1
@@ -918,6 +923,104 @@ async def test_set_post_accept_notification_failure_still_activates_durable_task
         assert await _table_count(stack.storage, "agent_tasks") == 1
         assert await _table_count(stack.storage, "turn_ingress_receipts") == 1
         assert await _table_count(stack.storage, "goal_command_receipts") == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_settlement_survives_observer_timeout_after_notification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[TaskRun] = []
+    settlement_entered = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def handler(run: TaskRun) -> None:
+        runs.append(run)
+
+    # The barrier controls ordering; this whole-case limit only catches a
+    # deadlock and does not impose a completion SLA on real SQLite writes.
+    async with (
+        asyncio.timeout(60.0),
+        _open_goal_rpc_stack(
+            tmp_path / "goal-set-observer-timeout.sqlite",
+            handler=handler,
+            wire_lifecycle=True,
+            wire_idle=False,
+        ) as stack,
+    ):
+        settle_goal_task = stack.storage.settle_goal_task
+
+        async def held_settlement(*args: Any, **kwargs: Any) -> Any:
+            settlement_entered.set()
+            await release_settlement.wait()
+            return await settle_goal_task(*args, **kwargs)
+
+        def fail_notification(_entry: Any) -> None:
+            raise RuntimeError("synthetic post-accept notification failure")
+
+        monkeypatch.setattr(stack.storage, "settle_goal_task", held_settlement)
+        monkeypatch.setattr(stack.manager, "notify_message_appended", fail_notification)
+        observer: asyncio.Task[Any] | None = None
+        wait_entry: asyncio.Task[bool] | None = None
+        try:
+            response = await _handle_goals_set(_set_params(), stack.context)
+            await settlement_entered.wait()
+            task_id = response["taskId"]
+            runtime_task = stack.runtime._tasks[task_id]
+            persisted = await stack.storage.get_agent_task(task_id)
+            goal = await stack.storage.get_goal(SOURCE_KEY)
+            assert response["accepted"] is True
+            assert persisted is not None and persisted.status == AgentTaskStatus.SUCCEEDED
+            assert goal is not None and goal.active_task_id == task_id
+            assert goal.turns_settled == 0
+            assert len(runs) == 1
+
+            # A blocked settlement must outlive this observer's own deadline.
+            with pytest.raises(TimeoutError):
+                await stack.runtime.wait(task_id, timeout=0.01)
+            assert runtime_task.cancel_requested is False
+            assert not runtime_task.done.is_set()
+            assert stack.runtime._tasks[task_id] is runtime_task
+
+            observer_waiting = asyncio.Event()
+            wait_for_completion = runtime_task.done.wait
+
+            async def observe_completion_wait() -> bool:
+                observer_waiting.set()
+                return await wait_for_completion()
+
+            monkeypatch.setattr(runtime_task.done, "wait", observe_completion_wait)
+            wait_entry = asyncio.create_task(observer_waiting.wait())
+            observer = asyncio.create_task(stack.runtime.wait(task_id))
+            completed, _ = await asyncio.wait(
+                {wait_entry, observer}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert wait_entry in completed, "observer returned without waiting for settlement"
+            assert not observer.done()
+
+            release_settlement.set()
+            task = await observer
+            goal = await stack.storage.get_goal(SOURCE_KEY)
+            assert task.status == AgentTaskStatus.SUCCEEDED
+            assert runtime_task.cancel_requested is False
+            assert runtime_task.done.is_set()
+            assert len(runs) == 1
+            assert goal is not None and goal.active_task_id is None
+            assert goal.status == "active"
+            assert goal.turns_started == 1
+            assert goal.turns_settled == 1
+            assert stack.runtime._reservations_by_session == {}
+            assert stack.runtime._tasks == {}
+            assert await _table_count(stack.storage, "transcript_entries") == 1
+            assert await _table_count(stack.storage, "agent_tasks") == 1
+            assert await _table_count(stack.storage, "turn_ingress_receipts") == 1
+            assert await _table_count(stack.storage, "goal_command_receipts") == 1
+        finally:
+            release_settlement.set()
+            observers = [task for task in (wait_entry, observer) if task is not None]
+            for task in observers:
+                task.cancel()
+            await asyncio.gather(*observers, return_exceptions=True)
 
 
 @pytest.mark.asyncio

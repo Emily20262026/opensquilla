@@ -45,7 +45,7 @@ export async function withDeadline(operation, label, timeoutMs) {
   const controller = new AbortController()
   try {
     return await Promise.race([
-      Promise.resolve().then(operation),
+      Promise.resolve().then(() => operation(controller.signal)),
       delay(timeoutMs, undefined, { signal: controller.signal }).then(() => {
         throw timeoutError(label, timeoutMs)
       }),
@@ -160,6 +160,58 @@ async function boundedDiagnostics(diagnostics, timeoutMs) {
 
 function childHasExited(child) {
   return child.exitCode !== null || child.signalCode !== null
+}
+
+// Only a fixture that intentionally leaves activity unknown should opt into
+// this action. Keep Playwright's main-process connection until the real dialog
+// has accepted the click; app.close() closes that connection after app.quit().
+export async function requestElectronQuitWithConfirmation(app, { signal, timeoutMs }) {
+  const child = app.process()
+  const deadline = Date.now() + timeoutMs
+  const remainingMs = () => Math.max(1, deadline - Date.now())
+  let acceptWindow
+  let acceptExit
+  let rejectFailure
+  let confirmationClicked = false
+  const windowReady = new Promise(resolve => { acceptWindow = resolve })
+  const exited = new Promise(resolve => { acceptExit = resolve })
+  const failed = new Promise((_, reject) => { rejectFailure = reject })
+  // An abort/exit may arrive while Playwright is still dispatching app.quit().
+  // Keep that failure observed until the current operation races it below.
+  void failed.catch(() => {})
+  const onWindow = page => acceptWindow(page)
+  const onExit = () => {
+    if (confirmationClicked) acceptExit()
+    else rejectFailure(new Error('Electron exited before the expected quit confirmation'))
+  }
+  const onAbort = () => rejectFailure(timeoutError('Expected quit confirmation', timeoutMs))
+  const wait = operation => Promise.race([operation, failed])
+  app.on('window', onWindow)
+  child.on('exit', onExit)
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    if (childHasExited(child)) {
+      throw new Error('Electron exited before the expected quit confirmation')
+    }
+    if (signal.aborted) throw timeoutError('Expected quit confirmation', timeoutMs)
+    await wait(app.evaluate(({ app }) => app.quit()))
+    const page = await wait(windowReady)
+    await wait(page.locator('[role="dialog"]').waitFor({
+      state: 'visible', timeout: remainingMs(),
+    }))
+    if (!page.url().startsWith('data:text/html;charset=utf-8,')) {
+      throw new Error('Expected the self-contained Desktop quit confirmation')
+    }
+    await wait(page.locator('#keep').waitFor({ state: 'visible', timeout: remainingMs() }))
+    confirmationClicked = true
+    await wait(page.locator('#confirm').click({ timeout: remainingMs(), noWaitAfter: true }))
+    if (childHasExited(child)) acceptExit()
+    await wait(exited)
+  } finally {
+    app.off('window', onWindow)
+    child.off('exit', onExit)
+    signal.removeEventListener('abort', onAbort)
+  }
 }
 
 function observeElectronShutdown(app) {
@@ -283,6 +335,7 @@ async function forceElectronProcessExit(child, phase, emit, observation) {
 export async function closeElectronWithDeadline({
   app,
   phase,
+  requestClose = () => app.close(),
   diagnostics,
   emit = line => console.error(line),
   timeoutMs = 15_000,
@@ -293,7 +346,9 @@ export async function closeElectronWithDeadline({
   // Capture the owned handle and events before close can dispose its dispatcher.
   const observation = observeElectronShutdown(app)
   try {
-    await withDeadline(() => app.close(), `${phase} Electron shutdown`, timeoutMs)
+    await withDeadline(
+      signal => requestClose({ signal, timeoutMs }), `${phase} Electron shutdown`, timeoutMs,
+    )
     const child = observation.child
     if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0
       || child.exitCode !== 0 || child.signalCode !== null) {

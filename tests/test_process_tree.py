@@ -489,7 +489,9 @@ async def test_posix_incomplete_empty_keeps_unproven_owner_record(
     persisted = object()
     owner.persisted_owner = persisted
     deleted: list[object] = []
-    monkeypatch.setattr(process_tree, "_delete_owner_record", deleted.append)
+    monkeypatch.setattr(
+        process_tree, "_delete_owner_record", lambda row, **_kwargs: deleted.append(row),
+    )
 
     class Input:
         closed = False
@@ -1253,7 +1255,7 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
         assert result == (0 if target_visible else 125)
         assert capture_flags == [True]
         assert set(captured_ids[0]) == ({101, 102, 103} if target_visible else {102, 103})
-        assert output_pipe.getvalue() == (b"YVE" if target_visible else b"YFU")
+        assert output_pipe.getvalue() == (b"YBVE" if target_visible else b"YBFU")
     finally:
         os.close(write_fd)
 
@@ -3245,7 +3247,9 @@ def test_owner_registry_retries_transient_insert_contention(
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def execute(self, statement: str, parameters: tuple[object, ...]) -> None:
+        def execute(
+            self, statement: str, parameters: tuple[object, ...] = (),
+        ) -> None:
             executed.append((statement, parameters))
 
     def connect(_path, *, timeout_seconds: float):
@@ -3276,7 +3280,9 @@ def test_owner_registry_retries_transient_insert_contention(
 
     assert attempts == [process_tree._OWNER_DATABASE_INSERT_TIMEOUT_SECONDS] * 3
     assert delays == list(process_tree._OWNER_DATABASE_INSERT_RETRY_DELAYS_SECONDS[:2])
-    assert len(executed) == 1
+    assert len(executed) == 3
+    assert executed[0] == ("BEGIN IMMEDIATE", ())
+    assert executed[-1] == ("COMMIT", ())
     assert reference.record.owner_id == "c" * 32
 
 
@@ -4151,7 +4157,7 @@ async def test_windows_job_completion_monitor_reclaims_persisted_row(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     owner = process_tree.ProcessTreeOwner(
         process=SimpleNamespace(returncode=0),
@@ -4178,7 +4184,7 @@ def test_pid_identity_mismatch_reclaims_stale_row_without_signalling(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monkeypatch.setattr(
         process_tree.socket,
@@ -4265,7 +4271,7 @@ def test_persisted_posix_stop_handles_anchor_cleanup_markers(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monotonic_values = iter(float(value) for value in range(10))
     monkeypatch.setattr(process_tree.time, "monotonic", lambda: next(monotonic_values))
@@ -4285,7 +4291,7 @@ def test_live_posix_owner_with_unavailable_control_endpoint_retains_row(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert process_tree._terminate_persisted_posix_owner_sync(reference) is False
@@ -4305,7 +4311,7 @@ def test_windows_controller_identity_mismatch_reclaims_row_without_opening_job(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
     monkeypatch.setattr(
         process_tree._WindowsJob,
@@ -4365,7 +4371,7 @@ def test_windows_recovered_job_cleanup_is_fail_safe(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert process_tree._terminate_persisted_windows_owner_sync(reference) is stopped
@@ -4425,7 +4431,7 @@ async def test_unsupported_platform_record_is_retained_fail_safe(
     monkeypatch.setattr(
         process_tree,
         "_delete_owner_record",
-        lambda row: deleted.append(row.record.owner_id),
+        lambda row, **_kwargs: deleted.append(row.record.owner_id),
     )
 
     assert await process_tree._terminate_persisted_owner(reference) is False
@@ -4476,6 +4482,10 @@ async def test_absent_and_newer_owner_registry_are_upgrade_safe(tmp_path) -> Non
         )
 
     assert process_tree._load_owner_records(state_dir) == ()
+    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="unsupported"):
+        await process_tree.has_persisted_processes_for_task(
+            state_dir, "synthetic-session", "synthetic-task",
+        )
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM task_process_owners").fetchone() == (2,)
 
@@ -4570,6 +4580,12 @@ async def test_concurrent_stop_after_gateway_crash_kills_deep_tree_and_isolates_
                 break
             await asyncio.sleep(0.01)
         assert all(not process_tree._strict_process_start_identity(pid) for pid in owned_pids)
+        assert not await process_tree.has_persisted_processes_for_task(
+            state_dir, "synthetic-session", "synthetic-task",
+        )
+        assert await process_tree.has_persisted_processes_for_task(
+            state_dir, "synthetic-other-session", "synthetic-other-task",
+        )
         remaining = process_tree._load_owner_records(state_dir)
         assert len(remaining) == 1
         assert remaining[0].record.session_digest == process_tree._owner_digest(
@@ -4639,3 +4655,36 @@ async def test_windows_job_kills_descendant_after_direct_leader_exits(tmp_path) 
         assert kernel32.WaitForSingleObject(child_handle, 5000) == 0
     finally:
         kernel32.CloseHandle(child_handle)
+
+
+@pytest.mark.asyncio
+async def test_persisted_task_residual_check_uses_exact_lineage(tmp_path, monkeypatch):
+    session = "synthetic-session"
+    task = "synthetic-task"
+    session_digest = process_tree._owner_digest("session", session)
+    task_digest = process_tree._owner_digest("task", task)
+    records = (
+        _synthetic_owner_reference(
+            tmp_path / "owners.sqlite3", owner_id="1" * 32,
+            parent_session_digest=session_digest, parent_task_digest=task_digest,
+        ),
+    )
+    reads = []
+
+    def load(state_dir, *, require_complete=False):
+        reads.append((state_dir, require_complete))
+        return records
+
+    monkeypatch.setattr(process_tree, "_load_owner_records", load)
+    assert await process_tree.has_persisted_processes_for_task(tmp_path, session, task)
+    assert not await process_tree.has_persisted_processes_for_task(tmp_path, "other", task)
+    assert reads == [(tmp_path, True), (tmp_path, True)]
+
+
+@pytest.mark.asyncio
+async def test_persisted_task_residual_check_rejects_unreadable_registry(tmp_path):
+    process_tree._owner_database_path(tmp_path).write_bytes(b"synthetic invalid database")
+    with pytest.raises(sqlite3.DatabaseError):
+        await process_tree.has_persisted_processes_for_task(
+            tmp_path, "synthetic-session", "synthetic-task",
+        )

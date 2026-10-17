@@ -47,6 +47,7 @@ from opensquilla.gateway.config import (  # noqa: E402
     resolve_listen_address,
 )
 from opensquilla.gateway.config_migration import ConfigParseError  # noqa: E402
+from opensquilla.gateway.shutdown import ShutdownRequest  # noqa: E402
 from opensquilla.paths import default_opensquilla_home  # noqa: E402
 
 log = structlog.get_logger(__name__)
@@ -80,6 +81,9 @@ class _GatewayShutdownWatchdog:
         self._timeout = max(0.0, timeout)
         self._exit_code = exit_code
         self._disarmed = threading.Event()
+        self._changed = threading.Event()
+        self._deadline_lock = threading.Lock()
+        self._deadline = time.monotonic() + self._timeout
         self._thread = threading.Thread(
             target=self._run,
             name="opensquilla-gateway-shutdown-watchdog",
@@ -91,9 +95,22 @@ class _GatewayShutdownWatchdog:
 
     def disarm(self) -> None:
         self._disarmed.set()
+        self._changed.set()
+
+    def tighten(self, deadline: float) -> None:
+        with self._deadline_lock:
+            self._deadline = min(self._deadline, deadline)
+        self._changed.set()
 
     def _run(self) -> None:
-        if self._disarmed.wait(self._timeout):
+        while not self._disarmed.is_set():
+            self._changed.clear()
+            with self._deadline_lock:
+                remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._changed.wait(remaining)
+        if self._disarmed.is_set():
             return
         log.error(
             "gateway.shutdown_watchdog_expired",
@@ -387,11 +404,12 @@ def run_gateway(
             "self-disable that pill.[/yellow]"
         )
 
+    watchdog: _GatewayShutdownWatchdog | None = None
     stall_watchdog = None
     stall_heartbeat_task: asyncio.Task[None] | None = None
 
     async def _run_inner() -> bool:
-        nonlocal stall_watchdog, stall_heartbeat_task
+        nonlocal watchdog, stall_watchdog, stall_heartbeat_task
         from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
 
         # This is deliberately opt-in.  The diagnostic thread is the only
@@ -517,6 +535,12 @@ def run_gateway(
 
         def _request_shutdown(reason: str) -> None:
             nonlocal shutdown_reason
+            request = getattr(getattr(getattr(server, "app", None), "state", None),
+                              "shutdown_request", None)
+            if isinstance(request, ShutdownRequest) and watchdog is not None:
+                watchdog.tighten(request.termination_deadline)
+            if reason == "desktop_quit":
+                shutdown_reason = reason
             if not shutdown.is_set():
                 log.info("gateway.shutdown_requested", reason=reason)
                 shutdown_reason = reason
@@ -576,8 +600,11 @@ def run_gateway(
                 explicit_shutdown = False
 
         exit_code = 0 if explicit_shutdown else 1
+        request = getattr(getattr(getattr(server, "app", None), "state", None),
+                          "shutdown_request", None)
         watchdog = _GatewayShutdownWatchdog(
-            timeout=gateway_shutdown_deadline(),
+            timeout=(max(0.0, request.termination_deadline - time.monotonic())
+                     if isinstance(request, ShutdownRequest) else gateway_shutdown_deadline()),
             exit_code=exit_code,
         )
         watchdog.start()
@@ -611,11 +638,17 @@ def run_gateway(
             if stall_watchdog is not None:
                 stall_watchdog.stop()
                 stall_watchdog = None
+            request = getattr(getattr(getattr(server, "app", None), "state", None),
+                              "shutdown_request", None)
+            if isinstance(request, ShutdownRequest) and request.mode == "quit":
+                # Keep the owned root alive while Desktop terminates its tree.
+                # Its force-stop window is the five seconds after our cleanup
+                # deadline; the watchdog remains the fallback if Desktop died.
+                await asyncio.Event().wait()
             watchdog.disarm()
             _flush_shutdown_streams()
             _force_process_exit(exit_code)
             return explicit_shutdown
-        watchdog.disarm()
         if explicit_shutdown:
             console.print("\n[yellow]Gateway stopped.[/yellow]")
         return explicit_shutdown
@@ -635,7 +668,11 @@ def run_gateway(
                     await task
 
     try:
-        explicit_shutdown = asyncio.run(_run())
+        try:
+            explicit_shutdown = asyncio.run(_run())
+        finally:
+            if watchdog is not None:
+                watchdog.disarm()
         if not explicit_shutdown:
             raise typer.Exit(code=1)
     except ValueError as exc:

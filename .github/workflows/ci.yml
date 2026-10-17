@@ -1294,6 +1294,13 @@ jobs:
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
+          node scripts/test-desktop-quit.mjs
+          node scripts/test-desktop-close-confirmation.mjs
+          node scripts/test-browser-quit-confirmation.mjs
+          node scripts/test-desktop-quit-failure.mjs
+          node scripts/test-desktop-quit-dialog.mjs
+          node scripts/test-desktop-process-cleanup.mjs
+          node scripts/test-desktop-process-cleanup-lifecycle.mjs
           node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
           node scripts/test-desktop-renderer-log.mjs
@@ -2159,6 +2166,9 @@ jobs:
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
+            tests/test_desktop/test_process_cleanup.py
+            tests/test_desktop/test_posix_quit_process_cleanup.py
+            tests/test_mcp/test_stdio_client.py
             tests/test_engine/test_request_execution_identity.py
             tests/test_gateway/test_session_model_routing_rpc.py
             tests/test_tools/test_execution_status.py
@@ -2731,6 +2741,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
@@ -2771,6 +2782,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
@@ -2779,6 +2791,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
@@ -2904,6 +2917,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.json
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.png
           if-no-files-found: error
           retention-days: 14
 

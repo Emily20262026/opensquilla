@@ -32,6 +32,27 @@ await writeFile(reportPath, `${JSON.stringify({ ok: false, status: 'running', ru
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-update-electron-'))
 let runningApp
 const results = []
+
+async function closeFixtureAfterFailure(app) {
+  return await closeElectronWithDeadline({
+    app: {
+      process: () => app.process(),
+      close: async () => {
+        // Failed assertions can leave these test-only gates held. Release them
+        // only in teardown, after the original failure has been recorded.
+        await app.evaluate(() => {
+          globalThis.windowsUpdateFixture?.releaseVerification()
+          globalThis.windowsUpdateFixture?.releaseDrain()
+        })
+        await app.close()
+      },
+    },
+    phase: 'Windows update fixture cleanup',
+    timeoutMs: 10_000,
+  })
+}
+
+
 function waitForElectronExit(app) {
   const child = app.process()
   if (child.exitCode !== null) return Promise.resolve(child.exitCode)
@@ -63,6 +84,7 @@ const names = [
   'applyWindowsInstaller', 'applyDownloadedUpdate', 'handleMainWindowClose', 'trustedMainWindowControlIpc',
   'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkDesktopUpdateCandidate', 'downloadDesktopUpdate', 'runDesktopUpdateDownload', 'checkForUpdates', 'showUpdateError',
   'desktopUpdatePlatform', 'resolveDesktopUpdate', 'desktopGatewayConnectionSuspendedForExit',
+  'holdQuitForTaskConfirmation',
 ]
 for (const name of names) assert.ok(functions.has(name), `production ${name} must exist`)
 const statements = []
@@ -227,7 +249,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
     await waitFor(async () => (await f.snapshot()).verificationHeld, 'retry verification before Quit')
     await f.app.evaluate(({ app }) => { globalThis.windowsUpdateFixture.closeWindow(); app.quit() })
     const deferred = await f.snapshot()
-    assert.equal(deferred.visible, false)
+    assert.equal(deferred.visible, true, 'held verification must keep the protected update visible')
     assert.equal(deferred.destroyed, false)
     assert.equal(deferred.quitRequestedDuringUpdateDrain, true)
     const closed = waitForElectronExit(f.app)
@@ -266,7 +288,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
     assert.equal((await f.snapshot()).counts.stops, 2, 'duplicate real renderer IPC cannot begin another drain')
     await f.app.evaluate(({ app }) => { globalThis.windowsUpdateFixture.closeWindow(); app.quit(); app.quit() })
     const deferred = await f.snapshot()
-    assert.equal(deferred.visible, false)
+    assert.equal(deferred.visible, true, 'held Gateway drain must keep the protected update visible')
     assert.equal(deferred.destroyed, false)
     assert.equal(deferred.gatewayPids.length, 1)
     assert.equal(deferred.counts.launches, 1)
@@ -306,7 +328,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
   await writeFile(reportPath, `${JSON.stringify({ ok: false, status: 'failed', runId, error: String(error), results }, null, 2)}\n`).catch(() => {})
   throw error
 } finally {
-  if (runningApp) await closeElectronWithDeadline({ app: runningApp, phase: 'Windows update fixture cleanup', timeoutMs: 10_000 }).catch(() => {})
+  if (runningApp) await closeFixtureAfterFailure(runningApp).catch(() => {})
   const cleanup = resolve(isolationRoot)
   const fromTemp = relative(resolve(tmpdir()), cleanup)
   assert.ok(fromTemp && !fromTemp.startsWith('..') && !fromTemp.includes(':'))

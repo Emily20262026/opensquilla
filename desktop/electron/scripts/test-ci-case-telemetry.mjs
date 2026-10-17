@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { EventEmitter, once } from 'node:events'
+import { EventEmitter, getEventListeners, once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
@@ -20,9 +20,13 @@ import {
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
   gatewayProcessSnapshot,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
+import { buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse } from '../dist/desktop-quit-dialog.js'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
+import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
+
 import { readLinuxProcessStat } from './e2e-posix-process-group.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -32,6 +36,159 @@ const outputPath = join(root, 'reports', 'cases.jsonl')
 const emitted = []
 
 try {
+  // Exercise the actual quit document's click handler without Electron. Only
+  // this explicit request callback may accept the expected interruption prompt.
+  for (const mode of ['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']) {
+    const calls = []
+    const child = new EventEmitter()
+    Object.assign(child, { pid: process.pid, exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
+    const app = new EventEmitter()
+    app.process = () => child
+    app.close = () => assert.fail('expected confirmation must precede Playwright app.close')
+    const listeners = new Map()
+    const html = buildDesktopQuitDialogHtml({
+      title: 'Synthetic quit', message: 'Synthetic unknown activity', detail: 'Synthetic cleanup',
+      keepRunning: 'Keep running', confirm: 'Stop tasks and quit',
+    })
+    // This repository-owned template has one fixed inline script. Reject a
+    // changed template shape instead of parsing or filtering arbitrary HTML.
+    const scriptStart = html.split('<script>')
+    assert.equal(scriptStart.length, 2, 'the generated quit document must have one script')
+    const scriptEnd = scriptStart[1].split('</script>')
+    assert.equal(scriptEnd.length, 2, 'the generated quit script must have a closing tag')
+    const buttons = new Map(['keep', 'confirm'].map(id => [id, {
+      addEventListener: (event, callback) => listeners.set(`${id}:${event}`, callback),
+      focus() {}, disabled: false,
+    }]))
+    runInNewContext(scriptEnd[0], {
+      document: {
+        getElementById: id => buttons.get(id) ?? null,
+        querySelectorAll: selector => { assert.equal(selector, 'button'); return [...buttons.values()] },
+      },
+      window: {
+        addEventListener() {},
+        opensquillaDesktop: { quitDialogRespond: response => {
+          assert.equal(response.remember, false)
+          calls.push(`ipc:${parseDesktopQuitDialogResponse(response)}`)
+          if (mode !== 'missing-exit') {
+            child.exitCode = 0
+            child.emit('exit', 0)
+          }
+        } },
+      },
+    })
+    const page = {
+      url: () => mode === 'wrong-window' ? 'opensquilla-app://desktop/' : 'data:text/html;charset=utf-8,synthetic',
+      locator: selector => ({
+        waitFor: async options => {
+          assert.ok(['[role="dialog"]', '#keep'].includes(selector))
+          assert.ok(options.timeout > 0 && options.timeout <= 100)
+        },
+        click: async options => {
+          assert.equal(selector, '#confirm')
+          assert.ok(options.timeout > 0 && options.timeout <= 100)
+          if (mode === 'click-failed') throw new Error('synthetic confirmation click failed')
+          calls.push('click')
+          listeners.get('confirm:click')()
+        },
+      }),
+    }
+    app.evaluate = async callback => callback({ app: { quit() {
+      calls.push('quit-request')
+      if (mode === 'early-exit') {
+        child.exitCode = 0
+        child.emit('exit', 0)
+      } else if (mode !== 'missing-window' && mode !== 'already-exited') {
+        app.emit('window', page)
+      }
+    } } })
+    const abort = new AbortController()
+    let seenSignal
+    const run = requestElectronQuitWithConfirmation(app, { signal: abort.signal, timeoutMs: 100 })
+    if (mode.startsWith('missing-')) setImmediate(() => abort.abort())
+    if (mode === 'confirm') {
+      await run
+      assert.deepEqual(calls, ['quit-request', 'click', 'ipc:confirm'])
+      // Verify that the shared shutdown helper supplies its one deadline's
+      // abort signal to custom requests and cancels it after completion.
+      const result = await closeElectronWithDeadline({
+        app, phase: 'synthetic-confirmed-quit', timeoutMs: 100,
+        requestClose: async options => {
+          assert.equal(options.timeoutMs, 100)
+          assert.equal(options.signal.aborted, false)
+          seenSignal = options.signal
+        },
+      })
+      assert.equal(result.closed, true)
+      assert.equal(seenSignal.aborted, true)
+    } else {
+      await assert.rejects(run, mode.startsWith('missing-')
+        ? /Expected quit confirmation timed out/
+        : mode === 'click-failed' ? /synthetic confirmation click failed/
+        : mode === 'wrong-window' ? /Expected the self-contained/ : /before the expected/)
+      if (mode !== 'missing-exit') assert.ok(!calls.includes('ipc:confirm'))
+    }
+    assert.equal(app.listenerCount('window'), 0)
+    assert.equal(child.listenerCount('exit'), 0)
+    assert.equal(getEventListeners(abort.signal, 'abort').length, 0)
+  }
+
+  {
+    // A missing expected dialog still exercises real cleanup. The strict
+    // shutdown helper must only force a process this test actually spawned.
+    const child = spawn(process.execPath, ['-e', `
+      process.on('disconnect', () => process.exit(0));
+      process.send({ type: 'ready', pid: process.pid });
+      setInterval(() => {}, 1000);
+    `], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+    })
+    const childClosed = new Promise(resolveClose => child.once('close', resolveClose))
+    try {
+      const [ready] = await once(child, 'message', { signal: AbortSignal.timeout(5_000) })
+      assert.deepEqual(ready, { type: 'ready', pid: child.pid })
+      const exitListeners = child.listenerCount('exit')
+      const app = new EventEmitter()
+      app.process = () => child
+      app.evaluate = async callback => callback({ app: { quit() {} } })
+      let sharedSignal
+      const result = await closeElectronWithDeadline({
+        app, phase: 'synthetic-missing-quit-dialog', timeoutMs: 25, emit() {},
+        requestClose: options => {
+          sharedSignal = options.signal
+          assert.equal(options.timeoutMs, 25)
+          return requestElectronQuitWithConfirmation(app, options)
+        },
+      })
+      const supportsOwnedTreeReaping = ['win32', 'linux'].includes(process.platform)
+      assert.equal(result.closed, false, 'a missing expected prompt must remain a failure')
+      assert.equal(result.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+      assert.equal(sharedSignal.aborted, true)
+      assert.equal(result.forcedExitSucceeded, supportsOwnedTreeReaping)
+      assert.equal(result.processTreeReaped, supportsOwnedTreeReaping)
+      assert.equal(child.exitCode !== null || child.signalCode !== null, supportsOwnedTreeReaping)
+      assert.equal(app.listenerCount('window'), 0)
+      assert.equal(child.listenerCount('exit'), exitListeners)
+      assert.equal(getEventListeners(sharedSignal, 'abort').length, 0)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      let closeTimer
+      try {
+        await Promise.race([
+          childClosed,
+          new Promise((_, reject) => {
+            closeTimer = setTimeout(() => reject(new Error('Owned missing-dialog fixture did not close')), 5_000)
+          }),
+        ])
+      } finally {
+        clearTimeout(closeTimer)
+      }
+    }
+    assert.throws(() => process.kill(child.pid, 0), { code: 'ESRCH' })
+  }
+
   for (const scheme of [
     'windows-creation-filetime:', 'linux-proc-start-ticks:', 'posix-ps-lstart:',
   ]) {
@@ -232,6 +389,136 @@ try {
     error: 'taskkill exceeded 25ms',
   })
 
+  // Execute the first-chat fixture's own completion/cleanup helpers. A visible
+  // response is insufficient: signed activity must become idle without consent.
+  const firstChatFixture = await readFile(join(scriptDir, 'test-onboarding-first-chat.mjs'), 'utf8')
+  const firstChatHelpers = firstChatFixture.slice(
+    firstChatFixture.indexOf('async function waitForFirstChatIdle('),
+    firstChatFixture.indexOf('// Do not let real model credentials'),
+  )
+  const idleActivity = { kind: 'ok', activeCount: 0,
+    activity: { running: 0, queued: 0, waiting: 0, reservations: 0, auxiliary: 0 } }
+  const fingerprint = 'a'.repeat(64)
+  const firstChatRecord = { profile_fingerprint: fingerprint, port: 18791 }
+  for (const mode of ['settles', 'never-idle', 'unreachable', 'late-idle', 'wrong-profile', 'wrong-port']) {
+    let now = 0
+    let reads = 0
+    const timeouts = []
+    const activity = [
+      { kind: 'ok', activeCount: 1, activity: { ...idleActivity.activity, running: 1 } },
+      { kind: 'ok', activeCount: 1, activity: { ...idleActivity.activity, auxiliary: 1 } },
+      { kind: 'unreachable' },
+      idleActivity,
+    ]
+    const scope = {
+      assert, join, URL, userDataDir: 'synthetic-user-data', lastActivity: null, gatewayRecord: null,
+      Date: { now: () => now }, delay: async milliseconds => { now += milliseconds },
+      captureFirstSendDiagnostic: async (operation, timeoutMs) => {
+        assert.equal(timeoutMs, 1_000 - now)
+        return await operation()
+      },
+      desktop: { evaluate: async () => ({ status: 'ready', profileFingerprint: fingerprint,
+        httpUrl: 'http://127.0.0.1:18791' }) },
+      loadDesktopGatewayOwnershipRecord: path => {
+        assert.equal(path, join('synthetic-user-data', 'gateway-ownership', fingerprint))
+        return { status: 'valid', record: mode === 'wrong-profile'
+          ? { ...firstChatRecord, profile_fingerprint: 'b'.repeat(64) }
+          : mode === 'wrong-port' ? { ...firstChatRecord, port: 18792 } : firstChatRecord }
+      },
+      readVerifiedDesktopGatewayActivity: async (record, options) => {
+        assert.equal(record, firstChatRecord)
+        assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 1_000 - now)
+        timeouts.push(options.timeoutMs)
+        reads++
+        if (mode === 'late-idle') { now = 1_000; return idleActivity }
+        if (mode === 'unreachable') return { kind: 'unreachable' }
+        if (mode === 'never-idle') return activity[0]
+        return activity.shift()
+      },
+    }
+    const waitIdle = runInNewContext(`${firstChatHelpers}\nwaitForFirstChatIdle`, scope)
+    if (mode === 'settles') {
+      await waitIdle(1_000)
+      assert.equal(reads, 4, 'wait through task settlement, auxiliary work and unknown activity')
+      assert.equal(scope.lastActivity, idleActivity)
+      assert.deepEqual(timeouts, [1_000, 800, 600, 400], 'all polls share the completion deadline')
+    } else if (mode.startsWith('wrong-')) {
+      await assert.rejects(waitIdle(1_000), /Expected values to be strictly equal/)
+      assert.equal(reads, 0, 'do not inspect an unrelated Gateway')
+    } else {
+      await assert.rejects(waitIdle(1_000), /did not become idle within its completion budget/)
+      assert.equal(now, 1_000)
+    }
+  }
+  {
+    const waitIdle = runInNewContext(`${firstChatHelpers}\nwaitForFirstChatIdle`, {
+      captureFirstSendDiagnostic, desktop: { evaluate: () => new Promise(() => {}) },
+    })
+    await assert.rejects(waitIdle(Date.now() + 25), /First-send diagnostics timed out after/,
+      'a hung renderer connection lookup must share the completion deadline')
+  }
+  for (const mode of ['success', 'close-failed', 'close-threw', 'server-failed', 'remove-failed',
+    'primary-error', 'windows-wrapper', 'windows-no-commit', 'windows-live-electron',
+    'windows-live-gateway', 'posix-wrapper']) {
+    const primary = new Error('synthetic chat assertion failed')
+    const cleanupFailure = new Error('synthetic shutdown failed')
+    const calls = []
+    const reports = []
+    const ownedApp = {}
+    const successful = ['success', 'windows-wrapper'].includes(mode)
+    const wrapperTimeout = mode.startsWith('windows-') || mode === 'posix-wrapper'
+    const committedLog = [
+      { event: 'quit_gateway_exit', exited: true, hardTerminated: false },
+      { event: 'desktop_exit_phase', to: 'committed', reason: 'all lifecycle-owned Gateways exited' },
+    ].map(record => JSON.stringify(record)).join('\n') + '\n'
+    const scope = {
+      app: ownedApp, passed: true, runError: mode === 'primary-error' ? primary : null,
+      appIdentity: {}, gatewayRecord: firstChatRecord,
+      lastActivity: idleActivity, stages: ['reply rendered', 'Gateway idle'], requests: [], diagnostics: [],
+      userDataRoot: 'synthetic-root', userDataDir: 'synthetic-user-data', outputDir: 'synthetic-output',
+      syntheticKey: 'synthetic-key', serverSockets: new Set(), join,
+      server: { closeAllConnections: () => calls.push('connections') },
+      closeElectronWithDeadline: async options => {
+        calls.push('electron')
+        assert.equal(options.app, ownedApp)
+        assert.equal(options.timeoutMs, 15_000)
+        assert.equal(options.requestClose, undefined, 'first chat must never accept a quit dialog')
+        assert.equal((await options.diagnostics()).lastActivity, idleActivity)
+        if (mode === 'close-threw') throw cleanupFailure
+        if (wrapperTimeout) return { closed: false, error: cleanupFailure,
+          closeErrorCode: 'DESKTOP_E2E_SHUTDOWN_TIMEOUT', forcedExitSucceeded: true, processTreeReaped: true }
+        return ['close-failed', 'primary-error'].includes(mode)
+          ? { closed: false, error: cleanupFailure } : { closed: true }
+      },
+      canAcceptWindowsElectronShutdownFallback: options => canAcceptWindowsElectronShutdownFallback({
+        ...options, platform: mode.startsWith('windows-') ? 'win32' : 'darwin',
+      }),
+      desktopShutdownEvidenceSince,
+      electronProcessSnapshot: () => ({ electronPidExists: mode === 'windows-live-electron' }),
+      gatewayProcessSnapshot: () => ({ alive: mode === 'windows-live-gateway' }),
+      console: { warn() {} },
+      closeHttpServerWithDeadline: async (_server, _sockets, options) => {
+        calls.push('server')
+        assert.equal(options.timeoutMs, 15_000)
+        if (mode === 'server-failed') throw cleanupFailure
+      },
+      rm: async () => { calls.push('remove'); if (mode === 'remove-failed') throw cleanupFailure },
+      readFile: async () => 'synthetic-key fixture log\n'
+        + (calls.includes('electron') && mode !== 'windows-no-commit' ? committedLog : ''),
+      writeFile: async (_path, body) => { calls.push('report'); reports.push(JSON.parse(body)) },
+    }
+    const finish = runInNewContext(`${firstChatHelpers}\nfinishFirstChat`, scope)
+    if (successful) await finish()
+    else await assert.rejects(finish(), error => error === (mode === 'primary-error' ? primary : cleanupFailure))
+    assert.deepEqual(calls.slice(0, 3), ['electron', 'connections', 'server'])
+    assert.equal(reports.length, 1)
+    assert.equal(reports[0].ok, successful, 'report success only after bounded cleanup')
+    assert.equal(calls.includes('remove'), successful || mode === 'remove-failed',
+      'retain the fixture profile after an assertion or shutdown failure')
+    assert.ok(!JSON.stringify(reports).includes('synthetic-key'), 'redact the synthetic credential')
+    assert.equal(calls.at(-1), 'report')
+  }
+
   // ElectronApplication.process() depends on a live Playwright dispatcher.
   // Successful close disposes it, so even diagnostics must retain the owned
   // ChildProcess beforehand instead of accessing the application afterward.
@@ -283,7 +570,10 @@ try {
   ]) {
     const ownedApp = {}
     let closeCalls = 0
-    let currentLog = ''
+    let currentLog = [...Array.from({ length: 30 }, () => ({
+      event: 'gateway_starting', path: secretProbe,
+    })), { event: 'quit_gateway_process_cleanup', pid: 1234, complete: false,
+      error: secretProbe }].map(record => JSON.stringify(record)).join('\n') + '\n'
     const scope = {
       app: ownedApp, activeAppUserData: 'synthetic-user-data', activeAppIdentity: {},
       ELECTRON_SHUTDOWN_TIMEOUT_MS: 15_000, join,
@@ -296,6 +586,14 @@ try {
           { event: 'before_quit', at: '2026-10-10T21:57:37.570Z', message: secretProbe },
           { event: 'desktop_exit_phase', to: 'draining', reason: secretProbe },
           { event: 'quit_deferred_for_profile_writer', at: secretProbe, error: secretProbe },
+          { event: 'quit_gateway_activity_checked', pid: 1234, kind: 'unreachable',
+            activeCount: null, ownershipMatched: null, retainedScope: true, exited: true,
+            gatewayStatus: 'ready', instance_nonce: secretProbe, record: { proof: secretProbe } },
+          { event: 'quit_confirmation_required', activity: 'unknown', message: secretProbe },
+          { event: 'quit_gateway_activity_checked', at: secretProbe, pid: secretProbe,
+            kind: secretProbe, activeCount: secretProbe, ownershipMatched: secretProbe,
+            retainedScope: secretProbe, exited: secretProbe, gatewayStatus: secretProbe,
+            activity: secretProbe, complete: secretProbe, code: secretProbe, signal: secretProbe },
           { event: secretProbe, token: secretProbe },
         ].map(record => JSON.stringify(record)).join('\n') + '\n'
         if (cleanExit) currentLog += cleanExitLog
@@ -304,6 +602,13 @@ try {
         assert.equal(diagnostics.processes.electronPidExists, electronPidExists)
         assert.ok(diagnostics.exitEvents.some(record => record.event === 'before_quit'))
         assert.ok(diagnostics.exitEvents.some(record => record.phase === 'draining'))
+        assert.ok(diagnostics.exitEvents.some(record => record.event === 'quit_gateway_activity_checked'
+          && record.pid === 1234 && record.retainedScope === true && record.exited === true))
+        assert.ok(diagnostics.exitEvents.some(record => record.event === 'quit_confirmation_required'
+          && record.activity === 'unknown'))
+        assert.ok(diagnostics.recentLifecycleEvents.length <= 24)
+        assert.ok(diagnostics.recentLifecycleEvents.some(record => record.pid === 1234
+          && record.event === 'quit_gateway_process_cleanup' && record.complete === false))
         assert.ok(!JSON.stringify(diagnostics).includes(secretProbe), 'diagnostics must omit raw log and probe errors')
         return shutdown
       },

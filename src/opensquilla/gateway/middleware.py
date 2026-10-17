@@ -130,6 +130,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # the per-instance ownership nonce instead of the operator API token.
         "/api/desktop/identity",
         "/api/desktop/shutdown",
+        "/api/desktop/lifecycle",
     }
     PUBLIC_PATH_PREFIXES = ("/api/v1/artifact-preview/",)
 
