@@ -79,6 +79,8 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.image_generation_policy import (
+    DEFAULT_IMAGE_GENERATION_PRIMARY,
+    LEGACY_DEFAULT_IMAGE_GENERATION_PRIMARY,
     conflicting_image_generation_endpoint_provider,
     is_valid_image_generation_base_url,
 )
@@ -741,7 +743,7 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
         },
         "model": {
             "type": "string",
-            "description": 'Optional provider/model identifier, e.g. "openai/gpt-image-1".',
+            "description": 'Optional provider/model identifier, e.g. "openai/gpt-image-2.5-flare".',
         },
         "filename": {
             "type": "string",
@@ -890,8 +892,30 @@ def _resolve_image_generation_candidates(model: str | None, config: Any) -> list
         add(fallback)
     primary = getattr(config, "primary", None)
     fallbacks = getattr(config, "fallbacks", []) or []
+    # A model name equal to today's default can still be an operator choice.
+    # Keep that choice across copies/reloads; only omitted defaults and old
+    # default routes without a custom binding may discover extra providers.
+    explicit_fields = getattr(config, "model_fields_set", None)
+    has_custom_binding = (
+        getattr(config, "binding", None) == "custom"
+        and (explicit_fields is None or "binding" in explicit_fields)
+    )
+    has_selected_default = (
+        primary == DEFAULT_IMAGE_GENERATION_PRIMARY
+        and (explicit_fields is None or "primary" in explicit_fields)
+    )
     has_explicit_model_routing = (
-        bool(model) or bool(fallbacks) or bool(primary and primary != "openai/gpt-image-1")
+        bool(model)
+        or bool(fallbacks)
+        or bool(
+            primary
+            and (
+                has_custom_binding
+                or has_selected_default
+                or primary
+                not in (DEFAULT_IMAGE_GENERATION_PRIMARY, LEGACY_DEFAULT_IMAGE_GENERATION_PRIMARY)
+            )
+        )
     )
     if not has_explicit_model_routing:
         for provider in list_image_generation_providers():

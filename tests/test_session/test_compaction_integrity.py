@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.provider.types import (
     ChatConfig,
@@ -62,6 +63,16 @@ def no_network(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.send", reject_network)
     yield
     assert not attempts, "an integrity test attempted an external request"
+
+
+@pytest.fixture(params=["default", "unavailable"], autouse=True)
+def tokenizer_mode(request, monkeypatch):
+    # A runner without a cached encoding can retain this fallback for its whole
+    # lifetime. Budget fixtures must keep their intended bounds in either mode.
+    if request.param == "unavailable":
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
 
 
 def source_entries():
@@ -235,11 +246,11 @@ async def test_fitting_refuses_to_delete_unextracted_fact_from_nonempty_summary(
     fact = "The retired route uses copper while the current route uses silver."
     text = (
         "Keep src/synthetic/main.py. "
-        + "Earlier ordinary context remains useful. " * 25
+        + "Earlier ordinary context remains useful. " * 20
         + fact
-        + " Recent ordinary context remains useful." * 25
+        + " Recent ordinary context remains useful." * 20
     )
-    assert estimate_tokens(text) < 1024
+    assert 200 < estimate_tokens(text) < 1024
     entries = source_entries()
     entries[0]["content"] += "\nFile src/synthetic/main.py.\n" + fact
     original = deepcopy(entries)
@@ -534,6 +545,10 @@ async def test_reasoning_and_body_use_current_generation_budget_without_a_body_c
     from opensquilla.session.tokenizer import estimate_tokens
 
     provider = SyntheticCompactionProvider("short body")
+    # Stay above the obsolete 1024 cap and below the generation allowance with
+    # both cl100k and the conservative UTF-8 fallback estimator.
+    reasoning = "reason " * 1100
+    assert 1024 < estimate_tokens(reasoning) < 4096
 
     def project(messages, tools=None, config=None, *, message_limit=None):
         return ProviderFinalRequestProjection(
@@ -547,8 +562,6 @@ async def test_reasoning_and_body_use_current_generation_budget_without_a_body_c
 
     async def chat(messages, tools=None, config=None):
         provider.calls.append((messages, tools, config))
-        reasoning = "synthetic reasoning " * 600
-        assert 1024 < estimate_tokens(reasoning) < 4096
         yield ReasoningDeltaEvent(text=reasoning)
         yield TextDeltaEvent(text="body " * 2000 if output_case == "long_body" else "short body")
         yield DoneEvent(output_tokens=3000, reasoning_tokens=2995)
@@ -584,15 +597,22 @@ async def test_necessary_chunks_can_use_more_than_two_calls_without_losing_sourc
     entries = [
         {
             "role": "user" if index % 2 == 0 else "assistant",
-            "content": f"item-{index} " + "unique long background " * 140,
+            "content": f"item-{index} " + "x!" * 210,
             "token_count": 600,
         }
         for index in range(20)
     ]
-    result = await compact_context(CompactionRequest(
+    request = CompactionRequest(
         session_id="necessary-chunks", entries=entries, context_window_tokens=8000,
         config=cfg, forced_prefix_cut=18 if forced else None,
-    ))
+    )
+    # A complete round must fit even with the conservative fallback, while the
+    # complete source must still require more than two provider calls.
+    budget = _compaction_target_input_budget(request)
+    assert estimate_tokens(_rolling_chunk_text("", entries[:2])) < budget
+    assert estimate_tokens(_rolling_chunk_text("", entries[:4])) > budget
+    assert estimate_tokens(_rolling_chunk_text("", entries[:18])) > budget * 2
+    result = await compact_context(request)
     if forced:
         assert result.removed_count == 18
     else:
@@ -720,7 +740,7 @@ def character_bounded_compaction_case(rounds=2, summary="Complete portable check
         entry
         for index in range(rounds)
         for entry in [
-            {"role": "user", "content": f"Round {index}: " + "layout " * 700},
+            {"role": "user", "content": f"Round {index}: " + "layout " * 650},
             {"role": "assistant", "content": f"Acknowledged round {index}"},
         ]
     ] + [
