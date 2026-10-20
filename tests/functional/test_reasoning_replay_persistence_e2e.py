@@ -648,6 +648,8 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(
                                       observer=observed, history_tokens=tokens, history_chars=chars)
         assert result["ok"] is True
         proof = result["comparison"]
+        assert proof["final_request"]["generation_budget"] == 2048
+        assert proof["summary_calls"] == (1 if tokens is not None else 0)
         assert proof["archive_preserved"] is True
         assert proof["compaction_applied"] is (tokens is not None)
         assert all(proof["answer_fact_checks"].values())
