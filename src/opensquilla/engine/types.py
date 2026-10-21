@@ -78,6 +78,11 @@ class ThinkingStartEvent:
     started_at: int = 0
     content_kind: Literal["summary", "reasoning"] = "reasoning"
     generation_epoch: int = 0
+    model_call_id: str = ""
+    iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -95,6 +100,9 @@ class ThinkingEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -104,6 +112,33 @@ class ThinkingEndEvent:
     block_index: int = 0
     status: Literal["completed", "interrupted", "error"] = "completed"
     ended_at: int = 0
+    generation_epoch: int = 0
+    model_call_id: str = ""
+    iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
+
+
+@dataclass
+class ProviderAttemptStartEvent:
+    """Internal checkpoint before a physical response publishes any content."""
+
+    kind: Literal["provider_attempt_start"] = field(default="provider_attempt_start", init=False)
+    model_call_id: str = ""
+    iteration: int = 0
+    generation_epoch: int = 0
+
+
+@dataclass
+class ProviderAttemptCommittedEvent:
+    """Internal boundary after a complete response passes runtime validation."""
+
+    kind: Literal["provider_attempt_committed"] = field(
+        default="provider_attempt_committed", init=False
+    )
+    model_call_id: str = ""
+    iteration: int = 0
     generation_epoch: int = 0
 
 
@@ -122,6 +157,9 @@ class TextDeltaEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -592,6 +630,8 @@ AgentEvent = (
     | ThinkingEvent
     | ThinkingEndEvent
     | TextDeltaEvent
+    | ProviderAttemptStartEvent
+    | ProviderAttemptCommittedEvent
     | RunHeartbeatEvent
     | ToolInputPreviewEvent
     | ProviderActivityEvent
