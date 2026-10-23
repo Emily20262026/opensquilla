@@ -507,6 +507,9 @@ _BOUNDED_INTERACTIVE_READS: ContextVar[bool] = ContextVar(
 _READ_CONNECTION: ContextVar[tuple[Any, Any] | None] = ContextVar(
     "opensquilla_session_read_connection", default=None,
 )
+_COMMITTED_HISTORY_VIEW: ContextVar[Any | None] = ContextVar(
+    "opensquilla_committed_history_view", default=None,
+)
 
 
 def _read_path_diagnostics_enabled() -> bool:
@@ -2466,6 +2469,50 @@ class SessionStorage:
             ) from exc
 
 
+    @property
+    def supports_committed_history_view(self) -> bool:
+        """Whether history can capture a view independently of the writer."""
+
+        return self._conn is not None and self._transcript_reader is not None
+
+    @property
+    def in_committed_history_view(self) -> bool:
+        """True only inside this storage's owned, budgeted history transaction."""
+
+        return _COMMITTED_HISTORY_VIEW.get() is self
+
+    async def read_committed_history_view[T](
+        self, operation: str, read: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Capture related history queries on one exclusive committed WAL lease.
+
+        The caller supplies a recovery budget. Nested storage methods reuse the
+        selected reader through _READ_CONNECTION. The pool retains its permit
+        until native work and transaction rollback have finished, even when the
+        caller's deadline/cancellation has already ended its wait.
+        """
+
+        if self.in_committed_history_view:
+            return await read()
+        if not self.supports_committed_history_view:
+            raise RuntimeError("Committed history views require independent WAL storage")
+        if current_read_budget() is None:
+            raise RuntimeError("Committed history views require a recovery read budget")
+        generation = self.connection_generation
+
+        async def capture(reader: Any) -> T:
+            if generation != self.connection_generation or reader is self._conn:
+                raise RuntimeError("History reader no longer owns the admitted storage generation")
+            await self._finish_sqlite_call(reader.execute("BEGIN"))
+            token = _COMMITTED_HISTORY_VIEW.set(self)
+            try:
+                return await read()
+            finally:
+                _COMMITTED_HISTORY_VIEW.reset(token)
+                # RecoveryReadPool._release owns rollback and physical cleanup.
+
+        return await self._run_recovery_read(operation, capture)
+
     def _raise_if_poisoned(self) -> None:
         if self._poisoned:
             raise StorageConnectionPoisonedError(
@@ -2816,7 +2863,22 @@ class SessionStorage:
         the serialized connection path because independent snapshots are unsafe.
         Bodies must use only read SQL on the yielded connection, without taking
         the writer gate or closing storage while holding this reader's gate.
+        Inside an admitted history view, reuse its snapshot and leave transaction
+        cleanup to the outer recovery lease.
         """
+
+        if self.in_committed_history_view:
+            self._raise_if_poisoned()
+            selected = _READ_CONNECTION.get()
+            budget = current_read_budget()
+            if (
+                selected is None or selected[0] is not self
+                or selected[1] is self._conn or budget is None
+            ):
+                raise RuntimeError("Committed history view no longer owns its reader")
+            budget.check()
+            yield selected[1]
+            return
 
         generation = self.connection_generation
         if self._transcript_reader is None:
